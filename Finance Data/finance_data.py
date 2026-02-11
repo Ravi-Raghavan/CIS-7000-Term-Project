@@ -1,8 +1,11 @@
 # Import yfinance
 import yfinance as yf
 
-# Fetch Sample Stock Ticker
-ticker = yf.Ticker("TSLA")
+# List of stock tickers
+tickers = ["AAPL", "NVDA", "TSLA", "META", "GOOG"]
 
-historical_asset_data = ticker.history(period="20y")
-print(historical_asset_data)
+# Fetch Historical Data for each ticker
+for ticker in tickers:
+    yf_ticker = yf.Ticker(ticker)
+    historical_asset_data = yf_ticker.history(period="50y")
+    historical_asset_data.to_csv(f"Historical_Data_{ticker}.csv")
