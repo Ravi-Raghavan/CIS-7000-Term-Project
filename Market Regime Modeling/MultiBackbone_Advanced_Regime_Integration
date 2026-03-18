@@ -1,0 +1,374 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+# =================================================================================
+# 1. AUTHORITATIVE MARKET REGIME DEFINITION & DATA PREPARATION
+# =================================================================================
+# DEFINITION & REASONING (WALL STREET STANDARDS):
+# Instead of a "black-box" HMM, we use authoritative definitions from financial 
+# media (WSJ, Bloomberg), the SEC, and quantitative research.
+# 
+# 1. SIMPLE MOVING AVERAGE (SMA) FORMULA & THE 200-DAY RATIONALE:
+#    - Formula: SMA_n = (P_1 + P_2 + ... + P_n) / n  (where P is the closing price, n is 200)
+#    - Why 200-day?: The 200-day SMA is the universal Wall Street benchmark for long-term 
+#      trend identification. Trading above it signifies a Bull regime; below it signifies Bear.
+#    - Reference: Faber, Mebane T. (2007) "A Quantitative Approach to Tactical Asset Allocation".
+#      Published in The Journal of Wealth Management.
+#    - URL: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=962461
+#    - Part Referenced: Section on "Timing Model", proving the 200-day SMA reduces 
+#      volatility and drawdowns by accurately identifying macro regime shifts.
+#
+# 2. CONTINUOUS TARGET (Market Temperature / Trend Magnitude): 
+#    - Formula: (SPY_Close - SPY_200_SMA) / SPY_200_SMA
+#    - Concept: Rather than a binary bull/bear toggle, momentum strength is continuous.
+#      Positive % distance = Bull momentum severity. Negative % distance = Bear severity.
+#    - Reference: Asness, Moskowitz, Pedersen (2013) "Value and Momentum Everywhere" (AQR Capital)
+#    - URL: https://www.aqr.com/Insights/Research/Journal-Article/Value-and-Momentum-Everywhere
+#    - Part Referenced: Time-series momentum (trend-following) is formally defined 
+#      by the asset's current price relative to its historical moving average.
+#
+# 3. DISCRETE TARGET (3-Class: Bear, Correction, Bull):
+#    - Bear Market (Class 0): Drawdown <= -20%.
+#    - Correction (Class 1): Drawdown between -10% and -19.9%.
+#    - Bull / Normal (Class 2): Drawdown > -10% and Price > 200 SMA.
+#    - Reference: U.S. Securities and Exchange Commission (SEC) & Investopedia.
+#    - URL 1 (SEC): https://www.sec.gov/reportspubs/investor-publications/investorpubsbearmarket
+#    - URL 2 (Investopedia): https://www.investopedia.com/terms/b/bearmarket.asp
+#    - Part Referenced: "A bear market is broadly defined as a 20% or more drop in broad 
+#      market indexes... A correction is a decline of 10% to 19.9%."
+# =================================================================================
+
+def get_macro_csv_path():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    csv_path = os.path.join(project_root, 'Finance Data', 'Historical_Data_MACRO.csv')
+    if not os.path.exists(csv_path):
+        csv_path = "Finance Data/Historical_Data_MACRO.csv"
+    return csv_path
+
+def load_and_prepare_authoritative_data():
+    csv_path = get_macro_csv_path()
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Cannot find {csv_path}. Please run download_macro_data.py first!")
+        
+    print(f"Loading local macro data from {csv_path}...")
+    df = pd.read_csv(csv_path)
+    df['Date'] = pd.to_datetime(df['Date'], utc=True)
+    
+    # Calculate daily returns & basic features (Ensuring both SPY and QQQ are heavily used)
+    df['SPY_Return'] = df['SPY_Close'].pct_change()
+    df['QQQ_Return'] = df['QQQ_Close'].pct_change()
+    df['SPY_Intraday_Vol'] = (df['SPY_High'] - df['SPY_Low']) / df['SPY_Open']
+    df['QQQ_Intraday_Vol'] = (df['QQQ_High'] - df['QQQ_Low']) / df['QQQ_Open']
+    df['SPY_Volume_Ratio'] = df['SPY_Volume'] / df['SPY_Volume'].rolling(window=20).mean()
+    
+    # ---------------------------------------------------------
+    # AUTHORITATIVE REGIME TARGET GENERATION
+    # ---------------------------------------------------------
+    # Calculate 200-Day SMA (Standard Trend Indicator)
+    df['SPY_200_SMA'] = df['SPY_Close'].rolling(window=200).mean()
+    
+    # Calculate 52-Week High (252 trading days)
+    df['SPY_52W_High'] = df['SPY_Close'].rolling(window=252).max()
+    
+    # Calculate Drawdown from 52-Week High
+    df['SPY_Drawdown'] = (df['SPY_Close'] - df['SPY_52W_High']) / df['SPY_52W_High']
+    
+    # TARGET 1: Continuous Regime Label (Market Temperature)
+    # Distance from 200 SMA. Positive = Bull, Negative = Bear.
+    df['Target_Regime_Continuous'] = (df['SPY_Close'] - df['SPY_200_SMA']) / df['SPY_200_SMA']
+    
+    # TARGET 2: Discrete 3-Class Regime Label
+    def classify_regime(row):
+        if pd.isna(row['SPY_Drawdown']): return np.nan
+        if row['SPY_Drawdown'] <= -0.20: return 0  # Bear Market (>= 20% drop)
+        elif row['SPY_Drawdown'] <= -0.10: return 1 # Correction (>= 10% drop)
+        else: return 2                              # Bull / Normal Market
+        
+    df['Target_Regime_Class'] = df.apply(classify_regime, axis=1)
+    
+    # Drop the first 252 rows which are NaN due to the 52-week rolling calculations
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+# ==========================================
+# 2. VISUALIZATION (PRE-TRAINING)
+# ==========================================
+
+def visualize_regime_and_splits(df):
+    """Visualizes the Train/Val/Test splits and the Continuous Regime Label."""
+    print("Generating visualization... Please close the plot window to begin training.")
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    
+    # 1. Plot Price & Splits
+    train_mask = df['Date'].dt.year < 2018
+    val_mask = (df['Date'].dt.year >= 2018) & (df['Date'].dt.year < 2020)
+    test_mask = df['Date'].dt.year >= 2020
+    
+    ax1.plot(df[train_mask]['Date'], df[train_mask]['SPY_Close'], label='Train (Pre-2018)', color='blue')
+    ax1.plot(df[val_mask]['Date'], df[val_mask]['SPY_Close'], label='Val (2018-2019)', color='orange')
+    ax1.plot(df[test_mask]['Date'], df[test_mask]['SPY_Close'], label='Test (2020+)', color='red')
+    
+    ax1.axvline(pd.to_datetime('2020-01-01', utc=True), color='black', linestyle='--', alpha=0.7)
+    ax1.set_title('SPY Macro Price History & Chronological Splits')
+    ax1.set_ylabel('SPY Close Price')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Plot Continuous Regime Label (Market Temperature)
+    ax2.plot(df['Date'], df['Target_Regime_Continuous'] * 100, color='purple', linewidth=1.5)
+    ax2.axhline(0, color='black', linestyle='-')
+    ax2.axhline(-20, color='red', linestyle='--', label='-20% Bear Market Threshold')
+    
+    # Fill areas based on regime
+    ax2.fill_between(df['Date'], 0, df['Target_Regime_Continuous'] * 100, where=(df['Target_Regime_Continuous'] > 0), facecolor='green', alpha=0.3, label='Bull Momentum')
+    ax2.fill_between(df['Date'], 0, df['Target_Regime_Continuous'] * 100, where=(df['Target_Regime_Continuous'] < 0), facecolor='red', alpha=0.3, label='Bear Momentum')
+    
+    ax2.set_title('Continuous Market Regime Target (% Distance from 200-Day SMA)')
+    ax2.set_ylabel('Regime Score (%)')
+    ax2.set_xlabel('Year')
+    
+    # Force X-axis to explicitly denote Years
+    ax2.xaxis.set_major_locator(mdates.YearLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show() # This will block the script until you close the window
+
+def visualize_predictions(dates, y_true, predictions_dict):
+    """Visualizes Model Predictions vs Actual Continuous Regime on the Test Set."""
+    print("Generating post-training comparison visualization...")
+    plt.figure(figsize=(14, 7))
+    
+    # Plot true values
+    plt.plot(dates, y_true, label='Actual Regime (True Market Temp)', color='black', linewidth=2, zorder=10)
+    
+    # Overlay model predictions
+    colors = ['blue', 'orange', 'green', 'red', 'purple']
+    for (name, preds), color in zip(predictions_dict.items(), colors):
+        plt.plot(dates, preds, label=f'{name} Prediction', color=color, alpha=0.7, linestyle='--')
+        
+    plt.axhline(0, color='gray', linestyle='-')
+    plt.title('Backbone Comparison: Predictions vs Actual Continuous Regime (Test Set: 2020+)')
+    plt.xlabel('Year')
+    plt.ylabel('Regime Score (Distance from 200 SMA)')
+    
+    # Force X-axis to explicitly denote Years
+    plt.gca().xaxis.set_major_locator(mdates.YearLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================
+# 3. CONNECTION TO MULTI-TASK MODEL
+# ==========================================
+class MultiTaskTargetGenerator:
+    """Utility class to merge all targets (Price, Sharpe, Regime) for the final model."""
+    def __init__(self, df):
+        self.df = df
+        
+    def get_multitask_targets(self):
+        targets = self.df[['SPY_Close', 'Target_Sharpe', 'Target_Regime_Continuous']].values
+        return targets
+
+# ==========================================
+# 4. DATASETS & SPLITTING
+# ==========================================
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        # Using float32 because we are now predicting a Continuous Regime target (Regression)
+        self.y = torch.tensor(y, dtype=torch.float32) 
+        
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def create_sequences_and_split(df, feature_cols, target_col, sequence_length=30):
+    X, y, dates = [], [], []
+    features = df[feature_cols].values
+    targets = df[target_col].values
+    date_array = df['Date'].values
+    
+    for i in range(len(features) - sequence_length):
+        X.append(features[i:i+sequence_length])
+        y.append(targets[i+sequence_length])
+        dates.append(date_array[i+sequence_length])
+        
+    X, y, dates = np.array(X), np.array(y), pd.to_datetime(dates)
+    
+    train_mask = dates.year < 2018
+    val_mask = (dates.year >= 2018) & (dates.year < 2020)
+    test_mask = dates.year >= 2020
+    
+    return (X[train_mask], y[train_mask], dates[train_mask]), \
+           (X[val_mask], y[val_mask], dates[val_mask]), \
+           (X[test_mask], y[test_mask], dates[test_mask])
+
+# ==========================================
+# 5. CONTINUOUS BASELINE MODELS (REGRESSORS)
+# ==========================================
+
+class FFNNRegressor(nn.Module):
+    def __init__(self, input_size, sequence_length, hidden_size=64):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size * sequence_length, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.fc2(self.relu(self.fc1(x))).squeeze()
+
+class RNNRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
+        super().__init__()
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        return self.fc(out[:, -1, :]).squeeze()
+
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :]).squeeze()
+
+class TCNRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64):
+        super().__init__()
+        self.conv = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        out = self.relu(self.conv(x))
+        out, _ = torch.max(out, dim=2)
+        return self.fc(out).squeeze()
+
+class TransformerRegressor(nn.Module):
+    def __init__(self, input_size, hidden_size=64):
+        super().__init__()
+        self.embedding = nn.Linear(input_size, hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        x = self.embedding(x)
+        out = self.transformer(x)
+        out = out.mean(dim=1)
+        return self.fc(out).squeeze()
+
+# ==========================================
+# 6. TRAINING LOOP & EVALUATION
+# ==========================================
+
+def run_continuous_regime_pipeline():
+    df = load_and_prepare_authoritative_data()
+    
+    # 1. VISUALIZE FIRST
+    visualize_regime_and_splits(df)
+    
+    # 2. PREPARE FEATURES (Using both SPY and QQQ explicitly)
+    features = ['SPY_Return', 'QQQ_Return', 'SPY_Volume_Ratio', 'SPY_Intraday_Vol', 'QQQ_Intraday_Vol']
+    scaler = StandardScaler()
+    df[features] = scaler.fit_transform(df[features])
+    
+    seq_length = 30
+    batch_size = 64
+    epochs = 10
+    
+    # We are predicting the CONTINUOUS target (Target_Regime_Continuous)
+    train_data, val_data, test_data = create_sequences_and_split(df, features, 'Target_Regime_Continuous', seq_length)
+    X_train, y_train, _ = train_data
+    X_val, y_val, _ = val_data
+    X_test, y_test, dates_test = test_data
+    
+    train_loader = DataLoader(TimeSeriesDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+    
+    models = {
+        "FFNN/LR": FFNNRegressor(input_size=len(features), sequence_length=seq_length),
+        "RNN": RNNRegressor(input_size=len(features)),
+        "LSTM": LSTMRegressor(input_size=len(features)),
+        "TCN": TCNRegressor(input_size=len(features)),
+        "Transformer": TransformerRegressor(input_size=len(features))
+    }
+    
+    # MSELoss for regression tasks
+    criterion = nn.MSELoss() 
+    results = []
+    test_predictions = {}
+    
+    print("\n" + "="*70)
+    print("--- Training Backbones to Predict Continuous Market Regime ---")
+    print("="*70)
+    
+    for name, model in models.items():
+        print(f"Training {name} Backbone...")
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0
+            for X_batch, y_batch in train_loader:
+                optimizer.zero_grad()
+                y_pred = model(X_batch)
+                loss = criterion(y_pred, y_batch)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                
+        # Evaluate on Validation & Test Set
+        model.eval()
+        with torch.no_grad():
+            X_val_tensor, y_val_tensor = torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.float32)
+            X_test_tensor, y_test_tensor = torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.float32)
+            
+            val_loss = criterion(model(X_val_tensor), y_val_tensor).item()
+            test_loss = criterion(model(X_test_tensor), y_test_tensor).item()
+            
+            # Save the test predictions for the final visualization
+            test_predictions[name] = model(X_test_tensor).numpy()
+            
+        results.append((name, total_loss/len(train_loader), val_loss, test_loss))
+        print(f"-> {name} | Train MSE: {total_loss/len(train_loader):.4f} | Val MSE: {val_loss:.4f} | Test MSE: {test_loss:.4f}\n")
+
+    print("="*70)
+    print(f"{'Backbone':<15} | {'Val MSE (2018-19)':<17} | {'Test MSE (2020+)':<15}")
+    print("-" * 70)
+    # Sort by Validation MSE (Lower is better)
+    for name, train, val, test in sorted(results, key=lambda x: x[2]):
+        print(f"{name:<15} | {val:>15.4f}   | {test:>14.4f}")
+    print("="*70)
+    
+    # 3. VISUALIZE POST-TRAINING RESULTS
+    visualize_predictions(dates_test, y_test, test_predictions)
+
+if __name__ == "__main__":
+    run_continuous_regime_pipeline()

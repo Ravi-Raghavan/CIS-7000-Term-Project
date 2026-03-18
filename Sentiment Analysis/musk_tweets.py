@@ -15,7 +15,7 @@ if os.path.exists(csv_path) and os.path.exists(quotes_csv_path):
 
     tweets_df['createdAt'] = pd.to_datetime(tweets_df['createdAt'])
     sorted_df = tweets_df.sort_values(by='createdAt', ascending=False)
-    columns_to_see = ['fullText', 'createdAt', 'retweet']
+    columns_to_see = ['fullText', 'createdAt']
     #print(tweets_df.head())  # Display the first few rows of the DataFrame
     print(sorted_df[columns_to_see].head(10))  # Display the column names
     print(sorted_df[columns_to_see].tail(10))  # Display the last 10 rows of the selected columns
