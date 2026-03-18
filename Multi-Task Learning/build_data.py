@@ -64,9 +64,6 @@ def load_and_align(data_dir: str) -> dict[str, pd.DataFrame]:
  
     return {ticker: frames[ticker].loc[common_idx] for ticker in STOCKS}
 
-# data = load_and_align("../Finance Data")
-# print(data['AAPL'])
-
 # ─────────────────────────────────────────────
 # 2. Compute targets
 # ─────────────────────────────────────────────
@@ -143,8 +140,6 @@ def compute_targets(frames: dict[str, pd.DataFrame]) -> dict[str, np.ndarray]:
         "direction":  direc,     # (T, K) int64
         "regime":     regime,    # (T,)   int64
     }
-
-# targets = compute_targets(data)
 
 # ─────────────────────────────────────────────
 # 3. Build raw data array + scale
@@ -240,4 +235,89 @@ class StockDataset(Dataset):
         x = self.data[:, t - self.seq_len : t, :]
         targets = {k: v[pred_t] for k, v in self.targets.items()}
         return x, targets
+
+# ─────────────────────────────────────────────
+# 6. Build Data-Loaders
+# ─────────────────────────────────────────────
+def build_dataloaders(
+    data_dir: str,
+    seq_len:    int   = SEQ_LEN,
+    horizon:    int   = HORIZON,
+    batch_size: int   = BATCH_SIZE,
+    split:      tuple = SPLIT) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
+    """
+    Full pipeline: load → align → compute targets → scale → split → Dataset → DataLoader.
+ 
+    Returns:
+        train_dl, val_dl, test_dl  — DataLoaders
+        meta                       — dict with scalers, date_index, split_dates, stocks
+    """
+
+    # ── Load ──
+    frames    = load_and_align(data_dir)
+    date_idx  = frames['AAPL'].index
+    T         = len(date_idx)
+
+    # ── Targets (computed on unscaled closes) ──
+    targets = compute_targets(frames)
+
+    # ── Raw feature array ──
+    data, scalers = build_arrays(frames)
+
+    # ── Split indices ──
+    train_end, val_end = split_indices(T, split)
+    print(f"Split → train: [{date_idx[0].date()} – {date_idx[train_end-1].date()}] "
+          f"({train_end} days)  |  "
+          f"val: [{date_idx[train_end].date()} – {date_idx[val_end-1].date()}]  |  "
+          f"test: [{date_idx[val_end].date()} – {date_idx[-1].date()}]")
+
+    # ── Fit scalers on TRAIN only, transform all splits ──
+    data_scaled = data.copy()
+    for i in range(len(STOCKS)):
+        scalers[i].fit(data[i, :train_end, :])
+        data_scaled[i, :, :] = scalers[i].transform(data[i, :, :])
+
+    # ── Slice targets per split ──
+    def slice_targets(start, end):
+        return {k: v[start:end] for k, v in targets.items()}
+
+    # Chronological Split of Data and targets
+    train_data = data_scaled[:, :train_end, :]
+    val_data   = data_scaled[:, train_end:val_end, :]
+    test_data  = data_scaled[:, val_end:, :]
+
+    train_targets = slice_targets(0, train_end)
+    val_targets   = slice_targets(train_end, val_end)
+    test_targets  = slice_targets(val_end, T)
+
+    # ── Datasets ──
+    train_ds = StockDataset(train_data, train_targets, seq_len, horizon)
+    val_ds   = StockDataset(val_data,   val_targets,   seq_len, horizon)
+    test_ds  = StockDataset(test_data,  test_targets,  seq_len, horizon)
+
+    print(f"Dataset sizes → train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
+
+    # ── DataLoaders ──
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_dl  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
+
+    meta = {
+        "scalers":     scalers,
+        "date_index":  date_idx,
+        "split_dates": {
+            "train": (date_idx[0],          date_idx[train_end - 1]),
+            "val":   (date_idx[train_end],  date_idx[val_end - 1]),
+            "test":  (date_idx[val_end],    date_idx[-1]),
+        },
+        "stocks":      STOCKS,
+        "features":    FEATURES,
+        "seq_len":     seq_len,
+        "horizon":     horizon,
+        "T":           T,
+        "train_end":   train_end,
+        "val_end":     val_end,
+    }
+ 
+    return train_dl, val_dl, test_dl, meta
 
