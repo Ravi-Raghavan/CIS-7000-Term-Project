@@ -160,7 +160,7 @@ def train(
 
     # Halve LR if val loss doesn't improve for 7 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=7, factor=0.5, verbose=False
+        optimizer, mode="min", patience=7, factor=0.5
     )
  
     # Store best validation loss, state, and epoch
