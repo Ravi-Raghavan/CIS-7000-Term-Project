@@ -156,9 +156,13 @@ def train(
     # Move model to device
     model = model.to(device)
  
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # weight_decay=1e-4 adds L2 regularisation — penalises large weights
+    # and reduces memorisation of training-era patterns
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    # Halve LR if val loss doesn't improve for 7 epochs
+    # Halve LR after 7 epochs of no val improvement.
+    # Patience=4 was tried but decayed LR too aggressively (8x drop by ep 23),
+    # preventing escape from local minima — patience=7 gives more exploration room.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=7, factor=0.5
     )
@@ -285,35 +289,40 @@ def train(
 if __name__ == "__main__":
     data_dir = "../Finance Data"
 
-    # Use CPU/MPS if possible
-    device = None
-    if "google.colab" in sys.modules:
-        # Running in Colab
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    else:
-        # Not in Colab (e.g., Mac)
-        device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    def get_device() -> torch.device:
+        """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    device = get_device()
  
     # ── Data ──────────────────────────────────────────────
+    # seq_len=60 gives the LSTM 2 months of context per sample (up from 30)
     train_dl, val_dl, test_dl, meta = build_dataloaders(
         data_dir,
-        seq_len=30,
+        seq_len=60,
         horizon=1,
         batch_size=32,
     )
- 
+
     # ── Model ─────────────────────────────────────────────
+    # Hyperparams from Phase-1 grid search (tune.py):
+    #   private_hidden=32, shared_hidden=64, spa_dim=32 — compact avoids overfit
+    #   dropout=0.1 — lower dropout preserved gradient signal on this dataset
     model = SPAMSJF(
         num_stocks=5,
-        input_dim=5,              # OHLCV
+        input_dim=5,              # 5 engineered features (see build_data.py)
         private_hidden=32,
         shared_hidden=64,
         spa_dim=32,
         num_direction_classes=3,
         num_regimes=2,            # bull / bear
-        dropout=0.2,
+        dropout=0.1,              # tuner found 0.1 > 0.3 on this dataset
     )
- 
+
     # ── Loss ──────────────────────────────────────────────
     criterion = JointLoss(
         lambda_return=1.0,
@@ -322,7 +331,7 @@ if __name__ == "__main__":
         lambda_direction=1.0,
         lambda_regime=0.5,
     )
- 
+
     # ── Train ─────────────────────────────────────────────
     results = train(
         model=model,
@@ -332,7 +341,7 @@ if __name__ == "__main__":
         test_dl=test_dl,
         device=device,
         epochs=100,
-        lr=1e-3,
+        lr=5e-4,       # tuner: slower convergence improves generalisation
         patience=15,
         checkpoint="best_spa_msjf.pt",
     )

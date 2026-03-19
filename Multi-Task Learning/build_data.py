@@ -1,7 +1,6 @@
 # Train MSJF Model 
 from spa_msjf import SPAMSJF
-import torch 
-import sys
+import torch
 import os
 import numpy as np
 import pandas as pd
@@ -11,28 +10,37 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, matthews_corrcoef, confusion_matrix
 from typing import Optional
 
-# Set up device
-# Use CPU/MPS if possible
-device = None
-if "google.colab" in sys.modules:
-    # Running in Colab
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-else:
-    # Not in Colab (e.g., Mac)
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+def get_device() -> torch.device:
+    """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = get_device()
 
 
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
 STOCKS       = ["AAPL", "GOOG", "META", "NVDA", "TSLA"]
-FEATURES     = ["Open", "High", "Low", "Close", "Volume"]
+FEATURES     = ["Open", "High", "Low", "Close", "Volume"]  # raw CSV columns
 
-SEQ_LEN      = 30       # lookback window (trading days)
+# Engineered stationary input features (replaces raw OHLCV):
+#   0. log_return     = log(Close_t / Close_{t-1})   — daily return
+#   1. hl_range       = (High - Low) / Close          — normalised intraday range
+#   2. oc_return      = (Close - Open) / Open          — open-to-close move
+#   3. log_vol_change = log(Volume_t / Volume_{t-1})  — volume momentum
+#   4. momentum_5     = log(Close_t / Close_{t-5})   — 5-day price momentum
+# Raw OHLCV drifts over years (AAPL went $15→$180); these features don't.
+INPUT_FEATURES = ["log_return", "hl_range", "oc_return", "log_vol_change", "momentum_5"]
+
+SEQ_LEN      = 60       # lookback window — 60 days gives more temporal context
 HORIZON      = 1        # predict 1 day ahead
 VOL_WINDOW   = 20       # rolling window for volatility / Sharpe
 DIR_THRESH   = 0.002    # ±0.2% → flat band for direction labels
-NUM_REGIMES  = 4        # Bear or Bull Market
+NUM_REGIMES  = 2        # Bear or Bull Market
 BATCH_SIZE   = 32
 SPLIT        = (0.8, 0.1, 0.1)
 
@@ -48,7 +56,8 @@ def load_and_align(data_dir: str) -> dict[str, pd.DataFrame]:
     frames = {}
     for ticker in STOCKS:
         path = os.path.join(data_dir, f"Historical_Data_{ticker}.csv")
-        df = pd.read_csv(path, parse_dates=["Date"])
+        df = pd.read_csv(path)
+        df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
         df = df.sort_values("Date").set_index("Date")
         df = df[FEATURES].dropna()
         frames[ticker] = df
@@ -147,20 +156,50 @@ def compute_targets(frames: dict[str, pd.DataFrame]) -> dict[str, np.ndarray]:
 
 def build_arrays(frames: dict[str, pd.DataFrame]) -> tuple[np.ndarray, list[StandardScaler]]:
     """
-    Stack OHLCV into (K, T, D) and fit one StandardScaler per stock
-    on the training portion only (caller must slice before fitting).
-    Returns unscaled (K, T, D) array and the list of scalers.
+    Compute 5 stationary engineered features per stock instead of raw OHLCV.
+    Raw prices drift over years which causes train/val distribution shift;
+    log-return-based features are stationary across the full 2012-2026 range.
+
+    Returns:
+        data    : (K, T, 5) float32 — unscaled engineered features
+        scalers : list of K StandardScalers (fitted by caller on train only)
     """
-    K = len(STOCKS) # Number of stocks
-    T = len(frames['AAPL']) # Length of Time Series
-    D = len(FEATURES) # Number of features
-    data = np.zeros((K, T, D), dtype=np.float32) # define raw data
+    K = len(STOCKS)
+    T = len(frames['AAPL'])
+    D = len(INPUT_FEATURES)  # 5 engineered features
+    data = np.zeros((K, T, D), dtype=np.float32)
 
-    # Populate Data
     for i, ticker in enumerate(STOCKS):
-        data[i, :, :] = frames[ticker][FEATURES].values.astype(np.float32)
+        df     = frames[ticker]
+        close  = df["Close"].values.astype(np.float64)
+        high   = df["High"].values.astype(np.float64)
+        low    = df["Low"].values.astype(np.float64)
+        open_  = df["Open"].values.astype(np.float64)
+        volume = df["Volume"].values.astype(np.float64)
 
-    # Construct Scalers
+        # 0. Daily log return — primary price signal, stationary
+        log_ret = np.concatenate([[0.0], np.diff(np.log(np.where(close > 0, close, 1.0)))])
+
+        # 1. Normalised intraday H-L range — measures daily volatility regime
+        hl_range = (high - low) / np.where(close > 0, close, 1.0)
+
+        # 2. Open-to-close return — captures intraday directional momentum
+        oc_return = (close - open_) / np.where(open_ > 0, open_, 1.0)
+
+        # 3. Log volume change — volume spikes signal institutional activity
+        log_vol        = np.log(np.where(volume > 0, volume, 1.0))
+        log_vol_change = np.concatenate([[0.0], np.diff(log_vol)])
+
+        # 4. 5-day price momentum — short-term trend signal
+        momentum_5       = np.zeros(T)
+        momentum_5[5:]   = np.log(close[5:] / np.where(close[:-5] > 0, close[:-5], 1.0))
+
+        data[i, :, 0] = log_ret.astype(np.float32)
+        data[i, :, 1] = hl_range.astype(np.float32)
+        data[i, :, 2] = oc_return.astype(np.float32)
+        data[i, :, 3] = log_vol_change.astype(np.float32)
+        data[i, :, 4] = momentum_5.astype(np.float32)
+
     scalers = [StandardScaler() for _ in range(K)]
     return data, scalers
 
@@ -272,10 +311,39 @@ def build_dataloaders(
           f"test: [{date_idx[val_end].date()} – {date_idx[-1].date()}]")
 
     # ── Fit scalers on TRAIN only, transform all splits ──
+    # Even though features are already stationary, StandardScaler removes
+    # any remaining mean/variance differences across features.
     data_scaled = data.copy()
     for i in range(len(STOCKS)):
         scalers[i].fit(data[i, :train_end, :])
         data_scaled[i, :, :] = scalers[i].transform(data[i, :, :])
+
+    # ── Normalise regression targets using TRAIN statistics only ──
+    # Without this, Sharpe MSE runs 10-18 because the model predicts near
+    # zero while true Sharpe spans roughly -3 to +3. Z-scoring brings all
+    # regression targets to the same unit scale, stabilising joint loss.
+
+    # Return: scale to unit variance (already near zero mean)
+    ret_std = np.nanstd(targets["return"][:train_end]) + 1e-8
+    targets["return"] = targets["return"] / ret_std
+
+    # Volatility: strictly positive, scale to unit variance
+    vol_std = np.nanstd(targets["volatility"][:train_end]) + 1e-8
+    targets["volatility"] = targets["volatility"] / vol_std
+
+    # Sharpe: clip outliers first then z-score
+    sharpe_mean = np.nanmean(targets["sharpe"][:train_end])
+    sharpe_std  = np.nanstd(targets["sharpe"][:train_end]) + 1e-8
+    targets["sharpe"] = np.clip(targets["sharpe"], -5.0, 5.0)
+    targets["sharpe"] = (targets["sharpe"] - sharpe_mean) / sharpe_std
+
+    # Store normalisation stats in meta so predictions can be de-normalised later
+    target_stats = {
+        "ret_std":     ret_std,
+        "vol_std":     vol_std,
+        "sharpe_mean": sharpe_mean,
+        "sharpe_std":  sharpe_std,
+    }
 
     # ── Slice targets per split ──
     def slice_targets(start, end):
@@ -303,20 +371,21 @@ def build_dataloaders(
     test_dl  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
 
     meta = {
-        "scalers":     scalers,
-        "date_index":  date_idx,
+        "scalers":      scalers,
+        "target_stats": target_stats,   # use these to de-normalise predictions
+        "date_index":   date_idx,
         "split_dates": {
             "train": (date_idx[0],          date_idx[train_end - 1]),
             "val":   (date_idx[train_end],  date_idx[val_end - 1]),
             "test":  (date_idx[val_end],    date_idx[-1]),
         },
-        "stocks":      STOCKS,
-        "features":    FEATURES,
-        "seq_len":     seq_len,
-        "horizon":     horizon,
-        "T":           T,
-        "train_end":   train_end,
-        "val_end":     val_end,
+        "stocks":       STOCKS,
+        "features":     INPUT_FEATURES,
+        "seq_len":      seq_len,
+        "horizon":      horizon,
+        "T":            T,
+        "train_end":    train_end,
+        "val_end":      val_end,
     }
  
     return train_dl, val_dl, test_dl, meta
