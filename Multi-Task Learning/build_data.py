@@ -9,9 +9,10 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, matthews_corrcoef, confusion_matrix
 from typing import Optional
+from pathlib import Path
 
 def get_device() -> torch.device:
-    """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
+    """CUDA (NVIDIA) to MPS (Apple Silicon) to CPU."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -33,13 +34,23 @@ FEATURES     = ["Open", "High", "Low", "Close", "Volume"]  # raw CSV columns
 #   2. oc_return      = (Close - Open) / Open          — open-to-close move
 #   3. log_vol_change = log(Volume_t / Volume_{t-1})  — volume momentum
 #   4. momentum_5     = log(Close_t / Close_{t-5})   — 5-day price momentum
-# Raw OHLCV drifts over years (AAPL went $15→$180); these features don't.
+# Raw OHLCV drifts over years (AAPL went $15to$180); these features don't.
 INPUT_FEATURES = ["log_return", "hl_range", "oc_return", "log_vol_change", "momentum_5"]
+
+# Sentiment features appended when CSVs exist in SENTIMENT_DIR.
+# Each adds 4 features per stock: sent_score, sent_count_log, sent_pos_ratio, has_news
+# has_news (0/1) tells the LSTM when sentiment is real vs a neutral fill-in —
+# without it, the model can't distinguish "no data" from "perfectly neutral news",
+# which causes sparse sentiment to act as noise rather than signal.
+# Pre-2020 dates (no scraping coverage) are filled with neutral values (0, 0, 0.333, 0).
+# If sentiment CSVs are absent, input_dim stays 5 and price features only are used.
+SENTIMENT_DIR      = "../Scraped_data/sentiment_daily"
+SENTIMENT_FEATURES = ["sent_score", "sent_count_log", "sent_pos_ratio", "has_news"]
 
 SEQ_LEN      = 60       # lookback window — 60 days gives more temporal context
 HORIZON      = 1        # predict 1 day ahead
 VOL_WINDOW   = 20       # rolling window for volatility / Sharpe
-DIR_THRESH   = 0.002    # ±0.2% → flat band for direction labels
+DIR_THRESH   = 0.002    # ±0.2% to flat band for direction labels
 NUM_REGIMES  = 2        # Bear or Bull Market
 BATCH_SIZE   = 32
 SPLIT        = (0.8, 0.1, 0.1)
@@ -68,10 +79,68 @@ def load_and_align(data_dir: str) -> dict[str, pd.DataFrame]:
         common_idx = common_idx.intersection(frames[ticker].index)
     common_idx = common_idx.sort_values()
  
-    print(f"Common date range: {common_idx[0].date()} → {common_idx[-1].date()} "
+    print(f"Common date range: {common_idx[0].date()} to {common_idx[-1].date()} "
           f"({len(common_idx)} trading days)")
  
     return {ticker: frames[ticker].loc[common_idx] for ticker in STOCKS}
+
+
+# ─────────────────────────────────────────────
+# 1b. Load sentiment features (optional)
+# ─────────────────────────────────────────────
+
+def load_sentiment(date_index: pd.DatetimeIndex) -> dict[str, np.ndarray] | None:
+    """
+    Load per-stock daily sentiment CSVs produced by build_sentiment.py.
+    Returns dict[ticker to (T, 3) float32] aligned to date_index,
+    or None if sentiment CSVs don't exist yet.
+
+    The 3 features per stock are:
+        0. sent_score      — mean FinBERT compound score  (-1 to +1)
+        1. sent_count_log  — log(1 + article_count)        — article volume signal
+        2. sent_pos_ratio  — fraction of positive articles  (0 to 1)
+
+    Dates with no coverage are forward-filled (≤3 days) then set to neutral.
+    Pre-2020 dates fall back to neutral: (0.0, 0.0, 0.333).
+    """
+    sent_dir = Path(SENTIMENT_DIR)
+    missing  = [t for t in STOCKS if not (sent_dir / f"{t}_sentiment.csv").exists()]
+
+    if missing:
+        # Any missing ticker to skip sentiment entirely to keep input_dim consistent
+        if len(missing) < len(STOCKS):
+            print(f"  Sentiment: skipping (missing CSVs for {missing}). "
+                  "Run build_sentiment.py first.")
+        return None
+
+    date_strs  = date_index.strftime("%Y-%m-%d")
+    T          = len(date_index)
+    sentiment  = {}
+
+    for ticker in STOCKS:
+        df = pd.read_csv(sent_dir / f"{ticker}_sentiment.csv")
+        df = df.set_index("date")
+
+        # Align to our trading calendar — fill any gaps with neutral
+        # 4 features: sent_score | sent_count_log | sent_pos_ratio | has_news
+        arr = np.zeros((T, 4), dtype=np.float32)
+        arr[:, 2] = 1 / 3   # neutral pos_ratio default
+        # arr[:, 3] = 0       # has_news = 0 by default (already zero)
+
+        for i, d in enumerate(date_strs):
+            if d in df.index and df.loc[d, "sent_count_log"] > 0:
+                arr[i, 0] = df.loc[d, "sent_score"]
+                arr[i, 1] = df.loc[d, "sent_count_log"]
+                arr[i, 2] = df.loc[d, "sent_pos_ratio"]
+                arr[i, 3] = 1.0   # has_news flag — tells LSTM this is real signal
+
+        sentiment[ticker] = arr
+
+    n_covered = sum((sentiment[STOCKS[0]][:, 1] > 0))
+    print(f"  Sentiment loaded: {n_covered}/{T} days have news coverage "
+          f"({n_covered/T*100:.1f}%)")
+    return sentiment
+
 
 # ─────────────────────────────────────────────
 # 2. Compute targets
@@ -154,19 +223,28 @@ def compute_targets(frames: dict[str, pd.DataFrame]) -> dict[str, np.ndarray]:
 # 3. Build raw data array + scale
 # ─────────────────────────────────────────────
 
-def build_arrays(frames: dict[str, pd.DataFrame]) -> tuple[np.ndarray, list[StandardScaler]]:
+def build_arrays(
+    frames:    dict[str, pd.DataFrame],
+    sentiment: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, list[StandardScaler]]:
     """
-    Compute 5 stationary engineered features per stock instead of raw OHLCV.
+    Compute stationary engineered features per stock instead of raw OHLCV.
     Raw prices drift over years which causes train/val distribution shift;
     log-return-based features are stationary across the full 2012-2026 range.
 
+    If sentiment dict is provided (from load_sentiment()), 3 sentiment features
+    are appended per stock, expanding input_dim from 5 to 8:
+        5. sent_score      — FinBERT compound score
+        6. sent_count_log  — log(1 + article_count)
+        7. sent_pos_ratio  — fraction of positive articles
+
     Returns:
-        data    : (K, T, 5) float32 — unscaled engineered features
+        data    : (K, T, D) float32  where D=5 (price only) or D=8 (price+sentiment)
         scalers : list of K StandardScalers (fitted by caller on train only)
     """
     K = len(STOCKS)
     T = len(frames['AAPL'])
-    D = len(INPUT_FEATURES)  # 5 engineered features
+    D = len(INPUT_FEATURES) + (len(SENTIMENT_FEATURES) if sentiment else 0)
     data = np.zeros((K, T, D), dtype=np.float32)
 
     for i, ticker in enumerate(STOCKS):
@@ -199,6 +277,15 @@ def build_arrays(frames: dict[str, pd.DataFrame]) -> tuple[np.ndarray, list[Stan
         data[i, :, 2] = oc_return.astype(np.float32)
         data[i, :, 3] = log_vol_change.astype(np.float32)
         data[i, :, 4] = momentum_5.astype(np.float32)
+
+        # Append 4 sentiment features if available (cols 5, 6, 7, 8)
+        # sent_score | sent_count_log | sent_pos_ratio | has_news
+        if sentiment is not None:
+            data[i, :, 5:9] = sentiment[ticker]   # (T, 4)
+
+    n_price = len(INPUT_FEATURES)
+    n_sent  = len(SENTIMENT_FEATURES) if sentiment else 0
+    print(f"  Features: {n_price} price + {n_sent} sentiment = {n_price + n_sent} total per stock")
 
     scalers = [StandardScaler() for _ in range(K)]
     return data, scalers
@@ -285,7 +372,7 @@ def build_dataloaders(
     batch_size: int   = BATCH_SIZE,
     split:      tuple = SPLIT) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
     """
-    Full pipeline: load → align → compute targets → scale → split → Dataset → DataLoader.
+    Full pipeline: load to align to compute targets to scale to split to Dataset to DataLoader.
  
     Returns:
         train_dl, val_dl, test_dl  — DataLoaders
@@ -297,18 +384,21 @@ def build_dataloaders(
     date_idx  = frames['AAPL'].index
     T         = len(date_idx)
 
+    # ── Sentiment (optional — loaded if CSVs exist from build_sentiment.py) ──
+    sentiment = load_sentiment(date_idx)
+
     # ── Targets (computed on unscaled closes) ──
     targets = compute_targets(frames)
 
-    # ── Raw feature array ──
-    data, scalers = build_arrays(frames)
+    # ── Raw feature array (price + optional sentiment) ──
+    data, scalers = build_arrays(frames, sentiment=sentiment)
 
     # ── Split indices ──
     train_end, val_end = split_indices(T, split)
-    print(f"Split → train: [{date_idx[0].date()} – {date_idx[train_end-1].date()}] "
+    print(f"Split to train: [{date_idx[0].date()} - {date_idx[train_end-1].date()}] "
           f"({train_end} days)  |  "
-          f"val: [{date_idx[train_end].date()} – {date_idx[val_end-1].date()}]  |  "
-          f"test: [{date_idx[val_end].date()} – {date_idx[-1].date()}]")
+          f"val: [{date_idx[train_end].date()} - {date_idx[val_end-1].date()}]  |  "
+          f"test: [{date_idx[val_end].date()} - {date_idx[-1].date()}]")
 
     # ── Fit scalers on TRAIN only, transform all splits ──
     # Even though features are already stationary, StandardScaler removes
@@ -363,29 +453,33 @@ def build_dataloaders(
     val_ds   = StockDataset(val_data,   val_targets,   seq_len, horizon)
     test_ds  = StockDataset(test_data,  test_targets,  seq_len, horizon)
 
-    print(f"Dataset sizes → train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
+    print(f"Dataset sizes to train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── DataLoaders ──
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
     test_dl  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
 
+    input_dim = data.shape[2]  # 5 (price only) or 8 (price + sentiment)
+
     meta = {
-        "scalers":      scalers,
-        "target_stats": target_stats,   # use these to de-normalise predictions
-        "date_index":   date_idx,
+        "scalers":       scalers,
+        "target_stats":  target_stats,   # use these to de-normalise predictions
+        "date_index":    date_idx,
         "split_dates": {
             "train": (date_idx[0],          date_idx[train_end - 1]),
             "val":   (date_idx[train_end],  date_idx[val_end - 1]),
             "test":  (date_idx[val_end],    date_idx[-1]),
         },
-        "stocks":       STOCKS,
-        "features":     INPUT_FEATURES,
-        "seq_len":      seq_len,
-        "horizon":      horizon,
-        "T":            T,
-        "train_end":    train_end,
-        "val_end":      val_end,
+        "stocks":        STOCKS,
+        "features":      INPUT_FEATURES + (SENTIMENT_FEATURES if sentiment else []),
+        "input_dim":     input_dim,       # passed to SPAMSJF so model adapts automatically
+        "sentiment":     sentiment is not None,
+        "seq_len":       seq_len,
+        "horizon":       horizon,
+        "T":             T,
+        "train_end":     train_end,
+        "val_end":       val_end,
     }
  
     return train_dl, val_dl, test_dl, meta

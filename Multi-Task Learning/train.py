@@ -309,19 +309,23 @@ if __name__ == "__main__":
     )
 
     # ── Model ─────────────────────────────────────────────
+    # input_dim comes from meta so it automatically adapts:
+    #   5 = price features only (no sentiment CSVs found)
+    #   8 = price + FinBERT sentiment (run build_sentiment.py first)
     # Hyperparams from Phase-1 grid search (tune.py):
     #   private_hidden=32, shared_hidden=64, spa_dim=32 — compact avoids overfit
     #   dropout=0.1 — lower dropout preserved gradient signal on this dataset
     model = SPAMSJF(
         num_stocks=5,
-        input_dim=5,              # 5 engineered features (see build_data.py)
+        input_dim=meta["input_dim"],   # auto: 5 (price) or 8 (price+sentiment)
         private_hidden=32,
         shared_hidden=64,
         spa_dim=32,
         num_direction_classes=3,
-        num_regimes=2,            # bull / bear
-        dropout=0.1,              # tuner found 0.1 > 0.3 on this dataset
+        num_regimes=2,                 # bull / bear
+        dropout=0.1,
     )
+    print(f"Input dim: {meta['input_dim']}  |  Sentiment: {meta['sentiment']}")
 
     # ── Loss ──────────────────────────────────────────────
     criterion = JointLoss(
