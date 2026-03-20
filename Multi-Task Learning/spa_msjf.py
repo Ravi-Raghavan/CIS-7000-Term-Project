@@ -217,10 +217,7 @@ class SPAMSJF(nn.Module):
         self.num_stocks = num_stocks
 
         # One private encoder per stock
-        self.private_encoders = nn.ModuleList([
-            PrivateEncoder(input_dim, private_hidden, dropout)
-            for _ in range(num_stocks)
-        ])
+        self.private_encoder = PrivateEncoder(input_dim, private_hidden, dropout)
 
         # Single shared encoder across all stocks (sees raw time series)
         self.shared_encoder = SharedEncoder(num_stocks, input_dim, shared_hidden, dropout)
@@ -252,7 +249,7 @@ class SPAMSJF(nn.Module):
 
         # 1. Private encoding: each stock independently
         private_feats = [
-            self.private_encoders[k](x[:, k, :, :])   # (B, private_hidden)
+            self.private_encoder(x[:, k, :, :])   # (B, private_hidden)
             for k in range(self.num_stocks)
         ]
 
