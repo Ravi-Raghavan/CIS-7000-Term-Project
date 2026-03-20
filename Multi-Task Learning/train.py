@@ -315,9 +315,9 @@ if __name__ == "__main__":
     model = SPAMSJF(
         num_stocks=5,
         input_dim=5,              # 5 engineered features (see build_data.py)
-        private_hidden=128,
-        shared_hidden=128,
-        spa_dim=128,
+        private_hidden=32,
+        shared_hidden=64,
+        spa_dim=32,
         num_direction_classes=3,
         num_regimes=2,            # bull / bear
         dropout=0.1,              # tuner found 0.1 > 0.3 on this dataset
