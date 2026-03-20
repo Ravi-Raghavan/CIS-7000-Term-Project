@@ -226,16 +226,10 @@ class SPAMSJF(nn.Module):
         self.shared_encoder = SharedEncoder(num_stocks, input_dim, shared_hidden, dropout)
 
         # One SPA module per stock (projects to common spa_dim, then weighted sum)
-        self.spa_modules = nn.ModuleList([
-            SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
-            for _ in range(num_stocks)
-        ])
+        self.spa_module = SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
 
-        # Per-stock task heads operate on spa_dim (the SPA output dimension)
-        self.task_heads = nn.ModuleList([
-            StockTaskHeads(spa_dim, num_direction_classes)
-            for _ in range(num_stocks)
-        ])
+        # Stock task head operates on spa_dim (the SPA output dimension)
+        self.task_head = StockTaskHeads(spa_dim, num_direction_classes)
 
         # Shared regime head (uses f_s only)
         self.regime_head = RegimeHead(shared_hidden, num_regimes)
@@ -268,8 +262,8 @@ class SPAMSJF(nn.Module):
         # 3. SPA + task heads per stock
         stock_outputs = []
         for k in range(self.num_stocks):
-            f_combined = self.spa_modules[k](f_s, private_feats[k])   # (B, combined_dim)
-            preds = self.task_heads[k](f_combined)
+            f_combined = self.spa_module(f_s, private_feats[k])   # (B, combined_dim)
+            preds = self.task_head(f_combined)
             stock_outputs.append(preds)
 
         # 4. Regime (shared encoder only)
