@@ -70,12 +70,12 @@ class SPA(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# 2. Private Encoder (one per stock)
+# 2. Private Decoder (one per stock)
 # ─────────────────────────────────────────────
 
-class PrivateEncoder(nn.Module):
+class PrivateDecoder(nn.Module):
     """
-    Single-stock LSTM encoder.
+    Single-Stock Decoder.
     Input:  (B, T, input_dim)  — OHLCV features over T timesteps
     Output: (B, private_dim)    — last hidden state
     """
@@ -85,44 +85,49 @@ class PrivateEncoder(nn.Module):
                         max_len: int = 500):
         super().__init__()
 
-        # Project input to model dimension
+        # Project Input features to Private Dimension Space
         self.input_proj = nn.Linear(input_dim, private_dim)
 
-        # Positional encoding
+        # Learned Position Embeddings
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, private_dim))
 
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
+        # Transformer Decoder Layer
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=private_dim,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # Transformer Decoder
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        # Dropout
         self.dropout = nn.Dropout(dropout)
+    
+    def _causal_mask(self, T, device):
+        return torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, input_dim)
         B, T, _ = x.shape
 
-        x = self.input_proj(x)                      # (B, T, private_dim)
-        x = x + self.pos_embedding[:, :T, :]        # add positional encoding
+        x = self.input_proj(x)
+        x = x + self.pos_embedding[:, :T, :]
 
-        x = self.transformer(x)                     # (B, T, private_dim)
+        tgt_mask = self._causal_mask(T, x.device)
 
-        # Fetch Final Last Hidden State
-        out = x[:, -1, :]                           # (B, private_dim)
+        x = self.transformer(tgt=x, memory=x, tgt_mask=tgt_mask)
 
+        out = x[:, -1, :]
         return self.dropout(out)
 
 
 # ─────────────────────────────────────────────
-# 3. Shared Encoder (sees all stocks)
+# 3. Shared Decoder (sees all stocks)
 # ─────────────────────────────────────────────
 
-class SharedEncoder(nn.Module):
+class SharedDecoder(nn.Module):
     """
     Encodes the concatenation of all stocks' raw time series to capture
     cross-stock (market-level) temporal patterns (paper Eq. 5).
@@ -141,36 +146,35 @@ class SharedEncoder(nn.Module):
         super().__init__()
 
         self.input_proj = nn.Linear(num_stocks * input_dim, shared_dim)
-
-        # Learned positional encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, shared_dim))
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=shared_dim,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
         self.dropout = nn.Dropout(dropout)
 
+    def _causal_mask(self, T, device):
+        return torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, K, T, input_dim)
         B, K, T, D = x.shape
 
-        # (B, T, K*D)
         x = x.permute(0, 2, 1, 3).reshape(B, T, K * D)
 
-        x = self.input_proj(x)                  # (B, T, shared_dim)
-        x = x + self.pos_embedding[:, :T, :]    # add positional encoding
+        x = self.input_proj(x)
+        x = x + self.pos_embedding[:, :T, :]
 
-        x = self.transformer(x)                 # (B, T, shared_dim)
+        tgt_mask = self._causal_mask(T, x.device)
 
-        # Fetch Final Last Hidden State
-        out = x[:, -1, :]                       # (B, shared_dim)
+        x = self.transformer(tgt=x, memory=x, tgt_mask=tgt_mask)
 
+        out = x[:, -1, :]
         return self.dropout(out)
 
 
@@ -209,7 +213,7 @@ class StockTaskHeads(nn.Module):
 
 class RegimeHead(nn.Module):
     """
-    Market regime classification using only the shared encoder output.
+    Market regime classification using only the shared decoder output.
     Regime is a market-wide state — deliberately isolated from stock-specific info.
     """
 
@@ -257,11 +261,11 @@ class SPAMSJF(nn.Module):
         super().__init__()
         self.num_stocks = num_stocks
 
-        # One private encoder per stock
-        self.private_encoder = PrivateEncoder(input_dim, private_hidden, dropout)
+        # One private decoder per stock
+        self.private_decoder = PrivateDecoder(input_dim, private_hidden, dropout)
 
-        # Single shared encoder across all stocks (sees raw time series)
-        self.shared_encoder = SharedEncoder(num_stocks, input_dim, shared_hidden, dropout)
+        # Single shared decoder across all stocks (sees raw time series)
+        self.shared_decoder = SharedDecoder(num_stocks, input_dim, shared_hidden, dropout)
 
         # One SPA module per stock (projects to common spa_dim, then weighted sum)
         self.spa_module = SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
@@ -290,12 +294,12 @@ class SPAMSJF(nn.Module):
 
         # 1. Private encoding: each stock independently
         private_feats = [
-            self.private_encoder(x[:, k, :, :])   # (B, private_hidden)
+            self.private_decoder(x[:, k, :, :])   # (B, private_hidden)
             for k in range(self.num_stocks)
         ]
 
         # 2. Shared encoding: sees raw time series from ALL stocks (paper Eq. 5)
-        f_s = self.shared_encoder(x)                   # (B, shared_hidden)
+        f_s = self.shared_decoder(x)                   # (B, shared_hidden)
 
         # 3. SPA + task heads per stock
         stock_outputs = []
@@ -304,7 +308,7 @@ class SPAMSJF(nn.Module):
             preds = self.task_head(f_combined)
             stock_outputs.append(preds)
 
-        # 4. Regime (shared encoder only)
+        # 4. Regime (shared decoder only)
         regime_logits = self.regime_head(f_s)          # (B, num_regimes)
 
         return {
