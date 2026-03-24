@@ -80,42 +80,20 @@ class PrivateEncoder(nn.Module):
     Output: (B, private_dim)    — last hidden state
     """
 
-    def __init__(self, input_dim: int, private_dim: int = 32, dropout: float = 0.2, 
-                        num_heads: int = 4, num_layers: int = 2, dim_feedforward: int = 128,
-                        max_len: int = 500):
+    def __init__(self, input_dim: int, private_dim: int = 32, dropout: float = 0.2):
         super().__init__()
-
-        # Project input to model dimension
-        self.input_proj = nn.Linear(input_dim, private_dim)
-
-        # Positional encoding
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, private_dim))
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=private_dim,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=private_dim,
+            num_layers=1,
+            batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, input_dim)
-        B, T, _ = x.shape
-
-        x = self.input_proj(x)                      # (B, T, private_dim)
-        x = x + self.pos_embedding[:, :T, :]        # add positional encoding
-
-        x = self.transformer(x)                     # (B, T, private_dim)
-
-        # Fetch Final Last Hidden State
-        out = x[:, -1, :]                           # (B, private_dim)
-
-        return self.dropout(out)
+        _, (h_n, _) = self.lstm(x)   # h_n: (1, B, private_dim)
+        return self.dropout(h_n.squeeze(0))  # (B, private_dim)
 
 
 # ─────────────────────────────────────────────
@@ -135,43 +113,24 @@ class SharedEncoder(nn.Module):
     across the full market, not just a single-step projection.
     """
 
-    def __init__(self, num_stocks: int, input_dim: int, shared_dim: int = 64, dropout: float = 0.2,
-                 num_heads: int = 4, num_layers: int = 2, dim_feedforward: int = 128,
-                 max_len: int = 500):
+    def __init__(self, num_stocks: int, input_dim: int, shared_dim: int = 64, dropout: float = 0.2):
         super().__init__()
-
-        self.input_proj = nn.Linear(num_stocks * input_dim, shared_dim)
-
-        # Learned positional encoding
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, shared_dim))
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=shared_dim,
-            nhead=num_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True
+        # Input at each timestep: all K stocks' features concatenated
+        self.lstm = nn.LSTM(
+            input_size=num_stocks * input_dim,
+            hidden_size=shared_dim,
+            num_layers=1,
+            batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, K, T, input_dim)
         B, K, T, D = x.shape
-
-        # (B, T, K*D)
+        # Concatenate all stocks' features at each timestep: (B, T, K*D)
         x = x.permute(0, 2, 1, 3).reshape(B, T, K * D)
-
-        x = self.input_proj(x)                  # (B, T, shared_dim)
-        x = x + self.pos_embedding[:, :T, :]    # add positional encoding
-
-        x = self.transformer(x)                 # (B, T, shared_dim)
-
-        # Fetch Final Last Hidden State
-        out = x[:, -1, :]                       # (B, shared_dim)
-
-        return self.dropout(out)
+        _, (h_n, _) = self.lstm(x)                 # h_n: (1, B, shared_dim)
+        return self.dropout(h_n.squeeze(0))         # (B, shared_dim)
 
 
 # ─────────────────────────────────────────────
