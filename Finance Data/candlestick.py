@@ -7,6 +7,7 @@ df = pd.read_csv("Historical_Data_AAPL.csv", parse_dates=['Date'])
 # Make sure it's sorted by date
 df = df.sort_values('Date')
 
+# Picked Last 6 months
 df = df[-100:]
 
 # Create candlestick chart
