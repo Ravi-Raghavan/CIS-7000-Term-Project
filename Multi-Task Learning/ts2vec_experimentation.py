@@ -25,13 +25,22 @@ model = TS2Vec(input_dims = 5, device=0, output_dims = 320)
 
 # ── Data ──────────────────────────────────────────────
 # seq_len=60 gives the LSTM 2 months of context per sample (up from 30)
-train_dl, val_dl, test_dl, meta = build_dataloaders(
+train_dl, _, _, _ = build_dataloaders(
     data_dir,
     seq_len=60,
     horizon=1,
     batch_size=32,
 )
 
+all_x = []
+
 for x, targets in train_dl:
-    print(x.shape)
-    break
+    # x: (B, S, T, D)
+    B, S, T, D = x.shape
+    
+    x_reshaped = x.view(B * S, T, D)   # (B*S, T, D)
+    all_x.append(x_reshaped)
+
+# Concatenate along batch dimension
+all_x = torch.cat(all_x, dim=0).cpu().numpy()  # (N, T, D)
+model.fit(all_x)
