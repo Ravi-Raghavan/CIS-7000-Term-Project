@@ -129,7 +129,7 @@ class PrivateDecoder(nn.Module):
 
 class SharedDecoder(nn.Module):
     """
-    Encodes the concatenation of all stocks' raw time series to capture
+    Represent the concatenation of all stocks' raw time series to capture
     cross-stock (market-level) temporal patterns (paper Eq. 5).
 
     Input:  (B, K, T, input_dim) — raw time series for all stocks
@@ -292,13 +292,13 @@ class SPAMSJF(nn.Module):
         assert x.shape[1] == self.num_stocks, \
             f"Expected {self.num_stocks} stocks, got {x.shape[1]}"
 
-        # 1. Private encoding: each stock independently
+        # 1. Private Representation: each stock independently
         private_feats = [
             self.private_decoder(x[:, k, :, :])   # (B, private_hidden)
             for k in range(self.num_stocks)
         ]
 
-        # 2. Shared encoding: sees raw time series from ALL stocks (paper Eq. 5)
+        # 2. Shared Representation: sees raw time series from ALL stocks (paper Eq. 5)
         f_s = self.shared_decoder(x)                   # (B, shared_hidden)
 
         # 3. SPA + task heads per stock
