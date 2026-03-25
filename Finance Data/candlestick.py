@@ -28,4 +28,5 @@ fig.update_layout(
     xaxis_rangeslider_visible=False  # hides the range slider
 )
 
-fig.show()
+# Save as static image
+fig.write_image("AAPL_candlestick.png", width=1200, height=600)
