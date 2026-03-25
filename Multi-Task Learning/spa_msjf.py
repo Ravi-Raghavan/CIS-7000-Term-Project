@@ -19,6 +19,21 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from typing import Optional
+from ts2vec import TS2Vec
+
+def get_device() -> torch.device:
+    """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = get_device()
+
+# Load Pre-trained TS2Vec Model
+trained_ts2vec_model = TS2Vec(input_dims = 5, device = device, output_dims = 320)
+trained_ts2vec_model.load("trained_ts2vec.pth")
 
 
 # ─────────────────────────────────────────────
@@ -261,11 +276,13 @@ class SPAMSJF(nn.Module):
         super().__init__()
         self.num_stocks = num_stocks
 
+        # input_dim -> encoded_dim = 320
+
         # One private decoder per stock
-        self.private_decoder = PrivateDecoder(input_dim, private_hidden, dropout)
+        self.private_decoder = PrivateDecoder(320, private_hidden, dropout)
 
         # Single shared decoder across all stocks (sees raw time series)
-        self.shared_decoder = SharedDecoder(num_stocks, input_dim, shared_hidden, dropout)
+        self.shared_decoder = SharedDecoder(num_stocks, 320, shared_hidden, dropout)
 
         # One SPA module per stock (projects to common spa_dim, then weighted sum)
         self.spa_module = SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
@@ -291,6 +308,12 @@ class SPAMSJF(nn.Module):
         """
         assert x.shape[1] == self.num_stocks, \
             f"Expected {self.num_stocks} stocks, got {x.shape[1]}"
+        
+        # 0. Apply TS2Vec Encoding to the sequence
+        B, K, T, input_dim = x.shape
+        x_reshaped = x.view(B * K, T, input_dim).cpu().numpy() # Shape (B * K, T, input_dim)
+        x_reshaped_encoded = trained_ts2vec_model.encode(x_reshaped).reshape(B, K, T, -1) # Shape (B * K, T, encoded_dim)
+        x = torch.from_numpy(x_reshaped_encoded).to(device = device)
 
         # 1. Private Representation: each stock independently
         private_feats = [

@@ -22,7 +22,7 @@ def get_device() -> torch.device:
 
 device = get_device()
 
-model = TS2Vec(input_dims = 5, device=0, output_dims = 320)
+model = TS2Vec(input_dims = 5, device= device, output_dims = 320)
 
 # ── Data ──────────────────────────────────────────────
 # seq_len=60 gives the LSTM 2 months of context per sample (up from 30)
@@ -45,10 +45,15 @@ for x, targets in train_dl:
 # Concatenate along batch dimension
 all_x = torch.cat(all_x, dim=0).cpu().numpy()  # (N, T, D)
 
-start_time = time.time()
-model.fit(all_x)
-end_time = time.time()
+# start_time = time.time()
+# model.fit(all_x)
+# end_time = time.time()
 
-# Save the Trained Model to a File
-model.save("trained_ts2vec.pth")
-print(f"Training Latency: {end_time - start_time}")
+# # Save the Trained Model to a File
+# model.save("trained_ts2vec.pth")
+# print(f"Training Latency: {end_time - start_time}")
+
+# Practice Inference
+model.load("trained_ts2vec.pth")
+test = model.encode(all_x)
+print(type(test), test.shape)
