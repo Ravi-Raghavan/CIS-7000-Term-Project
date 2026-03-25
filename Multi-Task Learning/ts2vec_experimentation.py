@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from typing import Optional
 from sklearn.metrics import accuracy_score
 from ts2vec import TS2Vec
+import time
 
 data_dir = "../Finance Data"
 
@@ -43,4 +44,11 @@ for x, targets in train_dl:
 
 # Concatenate along batch dimension
 all_x = torch.cat(all_x, dim=0).cpu().numpy()  # (N, T, D)
+
+start_time = time.time()
 model.fit(all_x)
+end_time = time.time()
+
+# Save the Trained Model to a File
+model.save("trained_ts2vec.pth")
+print(f"Training Latency: {end_time - start_time}")
