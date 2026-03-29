@@ -41,8 +41,8 @@ SUMMARY_FILE  = "tuning_summary.txt"
 BEST_CKPT     = "best_tuned_spa_msjf.pt"
 
 # Shared across all trials
-SEQ_LEN       = 30
-BATCH_SIZE    = 32
+SEQ_LEN       = 64 # Increase Context Window
+BATCH_SIZE    = 64 # Increase Batch Size
 MAX_EPOCHS    = 60       # hard cap per trial
 PATIENCE      = 8        # early-stop patience per trial
 STOCKS        = ["AAPL", "GOOG", "META", "NVDA", "TSLA"]
@@ -52,11 +52,13 @@ STOCKS        = ["AAPL", "GOOG", "META", "NVDA", "TSLA"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHASE1_GRID = {
-    "private_hidden": [32, 64],
-    "shared_hidden":  [64, 128],
-    "spa_dim":        [32, 64],
-    "dropout":        [0.1, 0.3],
-    "lr":             [1e-3, 5e-4],
+    "private_hidden": [128, 256, 512],
+    "shared_hidden":  [128, 256, 512],
+    "num_heads": [8, 12, 16],
+    "num_layers": [8, 12, 16],
+    "spa_dim":        [128, 256, 512],
+    "dropout":        [0.1, 0.3, 0.5],
+    "lr":             [1e-3, 5e-4, 1e-4],
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,11 +66,11 @@ PHASE1_GRID = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHASE2_GRID = {
-    "lambda_return":    [1.0, 2.0],
-    "lambda_vol":       [0.5, 1.0],
-    "lambda_sharpe":    [0.3, 0.5],
-    "lambda_direction": [1.0, 2.0],
-    "lambda_regime":    [0.5, 1.0],
+    "lambda_return":    [1.0, 2.0, 3.0],
+    "lambda_vol":       [0.5, 1.0, 2.0],
+    "lambda_sharpe":    [0.3, 0.5, 2.0],
+    "lambda_direction": [1.0, 2.0, 0.5],
+    "lambda_regime":    [0.5, 1.0, 0.5],
 }
 
 
@@ -93,11 +95,14 @@ def evaluate(model, loader, device) -> dict:
     model.eval()
     all_ret_pred  = [[] for _ in STOCKS]
     all_ret_true  = [[] for _ in STOCKS]
+    all_vol_pred  = [[] for _ in STOCKS]
+    all_vol_true  = [[] for _ in STOCKS]
     all_dir_pred  = [[] for _ in STOCKS]
     all_dir_true  = [[] for _ in STOCKS]
     all_shp_pred  = [[] for _ in STOCKS]
     all_shp_true  = [[] for _ in STOCKS]
-    all_reg_pred, all_reg_true = [], []
+    all_reg_pred  = []
+    all_reg_true  = []
 
     for x, targets in loader:
         x = x.to(device)
@@ -106,6 +111,8 @@ def evaluate(model, loader, device) -> dict:
             p = out["stocks"][k]
             all_ret_pred[k].append(p["return"].cpu())
             all_ret_true[k].append(targets["return"][:, k])
+            all_vol_pred[k].append(p["volatility"].cpu())
+            all_vol_true[k].append(targets["volatility"][:, k])
             all_dir_pred[k].append(p["direction"].argmax(-1).cpu())
             all_dir_true[k].append(targets["direction"][:, k])
             all_shp_pred[k].append(p["sharpe"].cpu())
@@ -116,18 +123,20 @@ def evaluate(model, loader, device) -> dict:
     def cat(lst): return torch.cat(lst).numpy()
 
     ret_mse  = np.mean([np.mean((cat(all_ret_pred[k]) - cat(all_ret_true[k]))**2)  for k in range(len(STOCKS))])
+    vol_mse  = np.mean([np.mean((cat(all_vol_pred[k]) - cat(all_vol_true[k]))**2)  for k in range(len(STOCKS))])
     shp_mse  = np.mean([np.mean((cat(all_shp_pred[k]) - cat(all_shp_true[k]))**2)  for k in range(len(STOCKS))])
     dir_acc  = np.mean([accuracy_score(cat(all_dir_true[k]), cat(all_dir_pred[k]))  for k in range(len(STOCKS))])
     reg_acc  = accuracy_score(cat(all_reg_true), cat(all_reg_pred))
 
     return {
         "return_mse": float(ret_mse),
+        "vol_mse": float(vol_mse),
         "sharpe_mse": float(shp_mse),
         "dir_acc":    float(dir_acc),
         "reg_acc":    float(reg_acc),
         # composite score: lower is better
         # normalises regression losses down, rewards classification accuracy
-        "score":      float(ret_mse + 0.3 * shp_mse - 0.5 * dir_acc - 0.3 * reg_acc),
+        "score":      float(ret_mse + 0.3 * vol_mse + 0.3 * shp_mse - 0.5 * dir_acc - 0.3 * reg_acc),
     }
 
 
@@ -145,7 +154,7 @@ def run_trial(
 ) -> dict:
     """Train one configuration, return val metrics at best checkpoint."""
 
-    arch = {k: cfg[k] for k in ("private_hidden", "shared_hidden", "spa_dim", "dropout")}
+    arch = {k: cfg[k] for k in ("private_hidden", "shared_hidden", "spa_dim", "dropout", "num_heads", "num_layers")}
     lr   = cfg["lr"]
     lambdas = {k: cfg[k] for k in ("lambda_return","lambda_vol","lambda_sharpe",
                                     "lambda_direction","lambda_regime")}
@@ -158,6 +167,8 @@ def run_trial(
         num_direction_classes=3,
         num_regimes=2,
         dropout=arch["dropout"],
+        num_heads=arch["num_heads"],
+        num_layers=arch["num_layers"]
     ).to(device)
 
     criterion = JointLoss(**lambdas)
@@ -225,6 +236,7 @@ def run_trial(
     metrics["elapsed"]  = round(elapsed, 1)
 
     print(f"  ✓ score={metrics['score']:.4f}  ret_mse={metrics['return_mse']:.5f}  "
+          f"  ✓ vol_mse={metrics['vol_mse']:.4f}  sharpe_mse={metrics['sharpe_mse']:.5f}  "
           f"dir_acc={metrics['dir_acc']:.3f}  reg_acc={metrics['reg_acc']:.3f}  "
           f"({elapsed:.0f}s)")
 
@@ -389,4 +401,19 @@ def main():
 
 
 if __name__ == "__main__":
+    # Log Start Time
+    overall_start = time.time()
+    print(f"\n{'='*60}")
+    print(f"  TUNING START TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+    # Run Train + Fine-Tune Routine
     main()
+
+    # Log End Time
+    overall_end = time.time()
+    print(f"\n{'='*60}")
+    print(f"  TUNING END TIME  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  TOTAL RUNTIME    : {overall_end - overall_start:.2f} seconds "
+          f"({(overall_end - overall_start)/60:.2f} minutes)")
+    print(f"{'='*60}")

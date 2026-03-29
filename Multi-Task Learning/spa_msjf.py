@@ -32,7 +32,8 @@ def get_device() -> torch.device:
 device = get_device()
 
 # Load Pre-trained TS2Vec Model
-trained_ts2vec_model = TS2Vec(input_dims = 5, device = device, output_dims = 320)
+TS2VEC_OUTPUT_DIM = 320
+trained_ts2vec_model = TS2Vec(input_dims = 5, device = device, output_dims = TS2VEC_OUTPUT_DIM)
 trained_ts2vec_model.load("trained_ts2vec.pth")
 
 
@@ -272,17 +273,17 @@ class SPAMSJF(nn.Module):
         num_direction_classes: int = 3,
         num_regimes: int = 4,
         dropout: float = 0.2,
+        num_heads: int = 4,
+        num_layers: int = 2
     ):
         super().__init__()
         self.num_stocks = num_stocks
 
-        # input_dim -> encoded_dim = 320
-
         # One private decoder per stock
-        self.private_decoder = PrivateDecoder(320, private_hidden, dropout)
+        self.private_decoder = PrivateDecoder(TS2VEC_OUTPUT_DIM, private_hidden, dropout, num_heads, num_layers)
 
         # Single shared decoder across all stocks (sees raw time series)
-        self.shared_decoder = SharedDecoder(num_stocks, 320, shared_hidden, dropout)
+        self.shared_decoder = SharedDecoder(num_stocks, TS2VEC_OUTPUT_DIM, shared_hidden, dropout, num_heads, num_layers)
 
         # One SPA module per stock (projects to common spa_dim, then weighted sum)
         self.spa_module = SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
