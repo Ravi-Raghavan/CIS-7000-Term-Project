@@ -19,22 +19,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from typing import Optional
-from ts2vec import TS2Vec
 
-def get_device() -> torch.device:
-    """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-device = get_device()
-
-# Load Pre-trained TS2Vec Model
+# TS2Vec encoding is now precomputed in build_data.py
+# The model receives 320-dim encoded features directly
 TS2VEC_OUTPUT_DIM = 320
-trained_ts2vec_model = TS2Vec(input_dims = 5, device = device, output_dims = TS2VEC_OUTPUT_DIM)
-trained_ts2vec_model.load("trained_ts2vec.pth")
 
 
 # ─────────────────────────────────────────────
@@ -96,13 +84,14 @@ class PrivateDecoder(nn.Module):
     Output: (B, private_dim)    — last hidden state
     """
 
-    def __init__(self, input_dim: int, private_dim: int = 32, dropout: float = 0.2, 
+    def __init__(self, input_dim: int, private_dim: int = 32, dropout: float = 0.2,
                         num_heads: int = 4, num_layers: int = 2, dim_feedforward: int = 128,
                         max_len: int = 500):
         super().__init__()
 
         # Project Input features to Private Dimension Space
         self.input_proj = nn.Linear(input_dim, private_dim)
+        self.layer_norm = nn.LayerNorm(private_dim)
 
         # Learned Position Embeddings
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, private_dim))
@@ -121,14 +110,14 @@ class PrivateDecoder(nn.Module):
 
         # Dropout
         self.dropout = nn.Dropout(dropout)
-    
+
     def _causal_mask(self, T, device):
         return torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
 
-        x = self.input_proj(x)
+        x = self.layer_norm(self.input_proj(x))
         x = x + self.pos_embedding[:, :T, :]
 
         tgt_mask = self._causal_mask(T, x.device)
@@ -162,6 +151,7 @@ class SharedDecoder(nn.Module):
         super().__init__()
 
         self.input_proj = nn.Linear(num_stocks * input_dim, shared_dim)
+        self.layer_norm = nn.LayerNorm(shared_dim)
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, shared_dim))
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -183,7 +173,7 @@ class SharedDecoder(nn.Module):
 
         x = x.permute(0, 2, 1, 3).reshape(B, T, K * D)
 
-        x = self.input_proj(x)
+        x = self.layer_norm(self.input_proj(x))
         x = x + self.pos_embedding[:, :T, :]
 
         tgt_mask = self._causal_mask(T, x.device)
@@ -209,10 +199,15 @@ class StockTaskHeads(nn.Module):
 
     def __init__(self, combined_dim: int, num_direction_classes: int = 3):
         super().__init__()
-        self.return_head    = nn.Linear(combined_dim, 1)
-        self.vol_head       = nn.Linear(combined_dim, 1)
-        self.sharpe_head    = nn.Linear(combined_dim, 1)
-        self.direction_head = nn.Linear(combined_dim, num_direction_classes)
+        mid = combined_dim // 2
+        self.return_head = nn.Sequential(
+            nn.Linear(combined_dim, mid), nn.GELU(), nn.Linear(mid, 1))
+        self.vol_head = nn.Sequential(
+            nn.Linear(combined_dim, mid), nn.GELU(), nn.Linear(mid, 1))
+        self.sharpe_head = nn.Sequential(
+            nn.Linear(combined_dim, mid), nn.GELU(), nn.Linear(mid, 1))
+        self.direction_head = nn.Sequential(
+            nn.Linear(combined_dim, mid), nn.GELU(), nn.Linear(mid, num_direction_classes))
 
     def forward(self, f_combined: torch.Tensor) -> dict[str, torch.Tensor]:
         return {
@@ -280,10 +275,14 @@ class SPAMSJF(nn.Module):
         self.num_stocks = num_stocks
 
         # One private decoder per stock
-        self.private_decoder = PrivateDecoder(TS2VEC_OUTPUT_DIM, private_hidden, dropout, num_heads, num_layers)
+        self.private_decoder = PrivateDecoder(
+            TS2VEC_OUTPUT_DIM, private_hidden, dropout, num_heads, num_layers,
+            dim_feedforward=private_hidden * 4)
 
         # Single shared decoder across all stocks (sees raw time series)
-        self.shared_decoder = SharedDecoder(num_stocks, TS2VEC_OUTPUT_DIM, shared_hidden, dropout, num_heads, num_layers)
+        self.shared_decoder = SharedDecoder(
+            num_stocks, TS2VEC_OUTPUT_DIM, shared_hidden, dropout, num_heads, num_layers,
+            dim_feedforward=shared_hidden * 4)
 
         # One SPA module per stock (projects to common spa_dim, then weighted sum)
         self.spa_module = SPA(shared_hidden, private_hidden, attn_dim=spa_dim)
@@ -309,12 +308,8 @@ class SPAMSJF(nn.Module):
         """
         assert x.shape[1] == self.num_stocks, \
             f"Expected {self.num_stocks} stocks, got {x.shape[1]}"
-        
-        # 0. Apply TS2Vec Encoding to the sequence
-        B, K, T, input_dim = x.shape
-        x_reshaped = x.view(B * K, T, input_dim).cpu().numpy() # Shape (B * K, T, input_dim)
-        x_reshaped_encoded = trained_ts2vec_model.encode(x_reshaped).reshape(B, K, T, -1) # Shape (B * K, T, encoded_dim)
-        x = torch.from_numpy(x_reshaped_encoded).to(device = device)
+
+        # x is already TS2Vec-encoded (B, K, T, 320) from build_data.py
 
         # 1. Private Representation: each stock independently
         private_feats = [
@@ -374,7 +369,7 @@ class JointLoss(nn.Module):
         }
         self.mse    = nn.MSELoss()
         self.huber  = nn.HuberLoss(delta=huber_delta)
-        self.ce     = nn.CrossEntropyLoss()
+        self.ce     = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     def forward(self, outputs: dict, targets: dict) -> tuple[torch.Tensor, dict]:
         """

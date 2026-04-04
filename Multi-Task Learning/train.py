@@ -34,8 +34,8 @@ STOCKS = ["AAPL", "GOOG", "META", "NVDA", "TSLA"]
 def evaluate(model, dataloader: DataLoader, device: torch.device) -> dict:
     """
     Compute per-task metrics over a dataloader.
-        Regression  (return, volatility, sharpe) → MSE per stock
-        Classification (direction, regime)        → accuracy
+        Regression  (return, volatility, sharpe) -> MSE per stock
+        Classification (direction, regime)        -> accuracy
     Returns: metrics[task][ticker_or_"market"]["MSE" or "accuracy"]
     """
     model.eval() # Put model in evaluation mode
@@ -96,8 +96,8 @@ def evaluate(model, dataloader: DataLoader, device: torch.device) -> dict:
  
 def print_metrics(metrics: dict, split_name: str = ""):
     """Pretty-print the metrics dict returned by evaluate()."""
-    header = f"── Metrics ({split_name}) " if split_name else "── Metrics "
-    print(f"\n{header}{'─' * (50 - len(header))}")
+    header = f"-- Metrics ({split_name}) " if split_name else "-- Metrics "
+    print(f"\n{header}{'-' * (50 - len(header))}")
  
     for task in ["return", "volatility", "sharpe"]:
         print(f"\n  {task.upper()}  (MSE)")
@@ -156,16 +156,17 @@ def train(
     # Move model to device
     model = model.to(device)
  
-    # weight_decay=1e-4 adds L2 regularisation — penalises large weights
-    # and reduces memorisation of training-era patterns
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    # AdamW with moderate weight decay
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
 
-    # Halve LR after 7 epochs of no val improvement.
-    # Patience=4 was tried but decayed LR too aggressively (8x drop by ep 23),
-    # preventing escape from local minima — patience=7 gives more exploration room.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=7, factor=0.5
-    )
+    # Cosine annealing with warmup
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
  
     # Store best validation loss, state, and epoch
     best_val_loss  = float("inf")
@@ -178,7 +179,7 @@ def train(
     print(f"Device: {device}  |  Trainable params: {n_params:,}")
     print(f"Epochs: {epochs}  |  LR: {lr}  |  Early stop patience: {patience}")
     print(f"\n{'Epoch':>6}  {'Train loss':>12}  {'Val loss':>10}  {'LR':>10}  {'':>5}")
-    print("─" * 52)
+    print("-" * 52)
  
     # Iterate through Epochs
     for epoch in range(1, epochs + 1):
@@ -225,7 +226,7 @@ def train(
                     val_losses[k] = val_losses.get(k, 0.0) + v
  
         val_losses = {k: v / len(val_dl) for k, v in val_losses.items()}
-        scheduler.step(val_losses["total"])
+        scheduler.step()
  
         # ── Checkpoint ─────────────────────────────────────
         is_best = val_losses["total"] < best_val_loss
@@ -256,7 +257,7 @@ def train(
         )
  
         if patience_count >= patience:
-            print(f"\nEarly stopping — no val improvement for {patience} epochs.")
+            print(f"\nEarly stopping - no val improvement for {patience} epochs.")
             break
  
     # ── Restore best weights ───────────────────────────────
@@ -266,11 +267,11 @@ def train(
               f"(val loss: {best_val_loss:.5f})")
  
     # ── Final evaluation ───────────────────────────────────
-    print("\n── Val metrics ──────────────────────────────────────")
+    print("\n-- Val metrics --------------------------------------")
     val_metrics = evaluate(model, val_dl, device)
     print_metrics(val_metrics, split_name="val")
  
-    print("── Test metrics ─────────────────────────────────────")
+    print("-- Test metrics -------------------------------------")
     test_metrics = evaluate(model, test_dl, device)
     print_metrics(test_metrics, split_name="test")
  
@@ -312,15 +313,20 @@ if __name__ == "__main__":
     # Hyperparams from Phase-1 grid search (tune.py):
     #   private_hidden=32, shared_hidden=64, spa_dim=32 — compact avoids overfit
     #   dropout=0.1 — lower dropout preserved gradient signal on this dataset
+    input_dim = meta.get("input_dim", 320)  # 320 after TS2Vec encoding
+    print(f"Input dim: {input_dim} (TS2Vec encoded)")
+
     model = SPAMSJF(
         num_stocks=5,
-        input_dim=5,              # 5 engineered features (see build_data.py)
-        private_hidden=32,
-        shared_hidden=64,
-        spa_dim=32,
+        input_dim=input_dim,
+        private_hidden=64,        # increased for 320-dim input
+        shared_hidden=128,        # increased for 320-dim input
+        spa_dim=64,               # increased to match
         num_direction_classes=3,
         num_regimes=2,            # bull / bear
-        dropout=0.1,              # tuner found 0.1 > 0.3 on this dataset
+        dropout=0.25,             # higher dropout to fight overfitting
+        num_heads=4,
+        num_layers=2,
     )
 
     # ── Loss ──────────────────────────────────────────────
@@ -329,7 +335,7 @@ if __name__ == "__main__":
         lambda_vol=0.5,
         lambda_sharpe=0.3,
         lambda_direction=1.0,
-        lambda_regime=0.5,
+        lambda_regime=1.0,
     )
 
     # ── Train ─────────────────────────────────────────────
@@ -341,7 +347,7 @@ if __name__ == "__main__":
         test_dl=test_dl,
         device=device,
         epochs=100,
-        lr=5e-4,       # tuner: slower convergence improves generalisation
+        lr=3e-4,       # slightly lower LR for better generalization
         patience=15,
         checkpoint="best_spa_msjf.pt",
     )

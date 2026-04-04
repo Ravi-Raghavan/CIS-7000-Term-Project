@@ -1,17 +1,14 @@
-# Train MSJF Model 
-from spa_msjf import SPAMSJF
 import torch
 import os
 import numpy as np
 import pandas as pd
-import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, matthews_corrcoef, confusion_matrix
 from typing import Optional
+from ts2vec import TS2Vec
 
 def get_device() -> torch.device:
-    """CUDA (NVIDIA) → MPS (Apple Silicon) → CPU."""
+    """CUDA (NVIDIA) -> MPS (Apple Silicon) -> CPU."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -19,6 +16,11 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 device = get_device()
+
+# Load pre-trained TS2Vec for encoding (once, at import time)
+TS2VEC_OUTPUT_DIM = 320
+_ts2vec_model = TS2Vec(input_dims=5, device=device, output_dims=TS2VEC_OUTPUT_DIM)
+_ts2vec_model.load("trained_ts2vec.pth")
 
 
 # ─────────────────────────────────────────────
@@ -68,7 +70,7 @@ def load_and_align(data_dir: str) -> dict[str, pd.DataFrame]:
         common_idx = common_idx.intersection(frames[ticker].index)
     common_idx = common_idx.sort_values()
  
-    print(f"Common date range: {common_idx[0].date()} → {common_idx[-1].date()} "
+    print(f"Common date range: {common_idx[0].date()} -> {common_idx[-1].date()} "
           f"({len(common_idx)} trading days)")
  
     return {ticker: frames[ticker].loc[common_idx] for ticker in STOCKS}
@@ -305,10 +307,10 @@ def build_dataloaders(
 
     # ── Split indices ──
     train_end, val_end = split_indices(T, split)
-    print(f"Split → train: [{date_idx[0].date()} – {date_idx[train_end-1].date()}] "
+    print(f"Split -> train: [{date_idx[0].date()} - {date_idx[train_end-1].date()}] "
           f"({train_end} days)  |  "
-          f"val: [{date_idx[train_end].date()} – {date_idx[val_end-1].date()}]  |  "
-          f"test: [{date_idx[val_end].date()} – {date_idx[-1].date()}]")
+          f"val: [{date_idx[train_end].date()} - {date_idx[val_end-1].date()}]  |  "
+          f"test: [{date_idx[val_end].date()} - {date_idx[-1].date()}]")
 
     # ── Fit scalers on TRAIN only, transform all splits ──
     # Even though features are already stationary, StandardScaler removes
@@ -345,14 +347,26 @@ def build_dataloaders(
         "sharpe_std":  sharpe_std,
     }
 
+    # ── Precompute TS2Vec encodings (once, not per forward pass) ──
+    # TS2Vec.encode() expects (N, T, D) numpy arrays.
+    # We encode each stock's full time series, then stack back to (K, T, 320).
+    print("Encoding features with pre-trained TS2Vec ...")
+    encoded_stocks = []
+    for i in range(len(STOCKS)):
+        stock_data = data_scaled[i:i+1, :, :]  # (1, T, 5)
+        enc = _ts2vec_model.encode(stock_data)  # (1, T, 320)
+        encoded_stocks.append(enc[0])           # (T, 320)
+    data_encoded = np.stack(encoded_stocks, axis=0)  # (K, T, 320)
+    print(f"TS2Vec encoding done: {data_scaled.shape} -> {data_encoded.shape}")
+
     # ── Slice targets per split ──
     def slice_targets(start, end):
         return {k: v[start:end] for k, v in targets.items()}
 
-    # Chronological Split of Data and targets
-    train_data = data_scaled[:, :train_end, :]
-    val_data   = data_scaled[:, train_end:val_end, :]
-    test_data  = data_scaled[:, val_end:, :]
+    # Chronological Split of encoded data and targets
+    train_data = data_encoded[:, :train_end, :]
+    val_data   = data_encoded[:, train_end:val_end, :]
+    test_data  = data_encoded[:, val_end:, :]
 
     train_targets = slice_targets(0, train_end)
     val_targets   = slice_targets(train_end, val_end)
@@ -363,7 +377,7 @@ def build_dataloaders(
     val_ds   = StockDataset(val_data,   val_targets,   seq_len, horizon)
     test_ds  = StockDataset(test_data,  test_targets,  seq_len, horizon)
 
-    print(f"Dataset sizes → train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
+    print(f"Dataset sizes -> train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── DataLoaders ──
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -381,6 +395,7 @@ def build_dataloaders(
         },
         "stocks":       STOCKS,
         "features":     INPUT_FEATURES,
+        "input_dim":    TS2VEC_OUTPUT_DIM,  # 320 after TS2Vec encoding
         "seq_len":      seq_len,
         "horizon":      horizon,
         "T":            T,
