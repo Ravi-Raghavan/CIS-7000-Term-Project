@@ -1,0 +1,71 @@
+import sys
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Kronos"))
+from model.kronos import KronosTokenizer
+
+KRONOS_EMBED_DIM = 256
+KRONOS_OUTPUT_DIM = 320
+VOCAB_SIZE = 1024
+
+class KronosEncoderWrapper(nn.Module):
+    def __init__(self, device, kronos_model_name="NeoQuasar/Kronos-Tokenizer-base"):
+        super().__init__()
+        self.device = device
+        self.tokenizer = KronosTokenizer.from_pretrained(kronos_model_name)
+        self.tokenizer.eval()
+        self.tokenizer.to(device)
+        for p in self.tokenizer.parameters():
+            p.requires_grad_(False)
+
+        self.emb_s1 = nn.Embedding(VOCAB_SIZE, KRONOS_EMBED_DIM)
+        self.emb_s2 = nn.Embedding(VOCAB_SIZE, KRONOS_EMBED_DIM)
+        self.fusion = nn.Linear(KRONOS_EMBED_DIM * 2, KRONOS_OUTPUT_DIM)
+
+    def precompute_tokens(self, raw_ohlcva: np.ndarray, chunk_size=512):
+        """
+        Runs frozen tokenizer over full time series.
+        Args:
+            raw_ohlcva: (K, T, 6) float32 — log1p-scaled, clipped ±5
+            chunk_size: max timesteps per forward pass (≤512 for Tokenizer-base)
+        Returns:
+            s1_tokens: (K, T) int64 numpy
+            s2_tokens: (K, T) int64 numpy
+        """
+        K, T, C = raw_ohlcva.shape
+        s1_all = []
+        s2_all = []
+        
+        self.tokenizer.eval()
+        with torch.no_grad():
+            for k in range(K):
+                stock_data = torch.tensor(raw_ohlcva[k], dtype=torch.float32).to(self.device) # (T, 6)
+                stock_s1 = []
+                stock_s2 = []
+                for i in range(0, T, chunk_size):
+                    chunk = stock_data[i:i+chunk_size].unsqueeze(0) # (1, chunk_size, 6)
+                    s1, s2 = self.tokenizer.encode(chunk, half=True)
+                    stock_s1.append(s1.cpu().numpy()[0])
+                    stock_s2.append(s2.cpu().numpy()[0])
+                s1_all.append(np.concatenate(stock_s1, axis=0)) # (T,)
+                s2_all.append(np.concatenate(stock_s2, axis=0)) # (T,)
+                
+        return np.array(s1_all, dtype=np.int64), np.array(s2_all, dtype=np.int64)
+
+    def forward(self, s1: torch.Tensor, s2: torch.Tensor) -> torch.Tensor:
+        """
+        Trainable path: token indices → 320D embeddings.
+        Args:
+            s1: (B, K, T) long
+            s2: (B, K, T) long
+        Returns:
+            (B, K, T, 320) float32
+        """
+        B, K, T = s1.shape
+        e1 = self.emb_s1(s1.view(B * K, T))      # (B*K, T, 256)
+        e2 = self.emb_s2(s2.view(B * K, T))      # (B*K, T, 256)
+        out = self.fusion(torch.cat([e1, e2], dim=-1))  # (B*K, T, 320)
+        return out.view(B, K, T, 320)
