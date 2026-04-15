@@ -248,7 +248,8 @@ def build_dataloaders(
     seq_len:    int   = SEQ_LEN,
     horizon:    int   = HORIZON,
     batch_size: int   = BATCH_SIZE,
-    split:      tuple = SPLIT) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
+    split:      tuple = SPLIT,
+    lora_path:  str   = None) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
 
     frames    = load_and_align(data_dir)
     date_idx  = frames['AAPL'].index
@@ -289,7 +290,7 @@ def build_dataloaders(
     }
 
     print("Encoding features with pre-trained Kronos Tokenizer ...")
-    wrapper = KronosEncoderWrapper(device)
+    wrapper = KronosEncoderWrapper(device, lora_path=lora_path)
     kronos_raw = build_kronos_raw_input(frames)
     s1_tokens, s2_tokens = wrapper.precompute_tokens(kronos_raw)
     print(f"Kronos encoding done: s1_tokens={s1_tokens.shape}, s2_tokens={s2_tokens.shape}")
@@ -337,5 +338,5 @@ def build_dataloaders(
         "val_end":      val_end,
         "wrapper":      wrapper,
     }
- 
+
     return train_dl, val_dl, test_dl, meta

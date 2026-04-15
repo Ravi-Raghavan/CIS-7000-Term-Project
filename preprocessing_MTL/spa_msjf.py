@@ -293,11 +293,11 @@ class SPAMSJF(nn.Module):
         # Shared regime head (uses f_s only)
         self.regime_head = RegimeHead(shared_hidden, num_regimes)
 
-    def forward(self, x: torch.Tensor) -> dict:
+    def forward(self, x_shared: torch.Tensor, x_private: torch.Tensor) -> dict:
         """
         Args:
-            x: shape (B, K, T, input_dim)
-               B = batch size, K = num_stocks, T = seq len, input_dim = features
+            x_shared:  (B, K, T, 320) — s1 coarse embeddings → SharedDecoder
+            x_private: (B, K, T, 320) — s1+s2 full embeddings → PrivateDecoder
 
         Returns:
             dict with keys:
@@ -306,19 +306,17 @@ class SPAMSJF(nn.Module):
                   "direction"                       → (B, num_direction_classes)
               "regime": (B, num_regimes)
         """
-        assert x.shape[1] == self.num_stocks, \
-            f"Expected {self.num_stocks} stocks, got {x.shape[1]}"
+        assert x_shared.shape[1] == self.num_stocks, \
+            f"Expected {self.num_stocks} stocks, got {x_shared.shape[1]}"
 
-        # x is already TS2Vec-encoded (B, K, T, 320) from build_data.py
-
-        # 1. Private Representation: each stock independently
+        # 1. Private Representation: each stock sees its own full (s1+s2) tokens
         private_feats = [
-            self.private_decoder(x[:, k, :, :])   # (B, private_hidden)
+            self.private_decoder(x_private[:, k, :, :])   # (B, private_hidden)
             for k in range(self.num_stocks)
         ]
 
-        # 2. Shared Representation: sees raw time series from ALL stocks (paper Eq. 5)
-        f_s = self.shared_decoder(x)                   # (B, shared_hidden)
+        # 2. Shared Representation: sees coarse (s1) tokens across ALL stocks
+        f_s = self.shared_decoder(x_shared)                # (B, shared_hidden)
 
         # 3. SPA + task heads per stock
         stock_outputs = []

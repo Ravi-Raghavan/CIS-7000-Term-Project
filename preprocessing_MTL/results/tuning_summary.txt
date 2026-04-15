@@ -1,0 +1,44 @@
+============================================================
+  KRONOS + SPA-MSJF TUNING SUMMARY
+============================================================
+
+── Phase 1: Top 5 Architecture Configs ──
+     Score  priv_h  shar_h  spa_d   drop        lr
+    0.8473      32      64     32    0.4    0.0001
+    0.8473      64      64     32    0.5    0.0001
+    0.8483      64      64     32    0.5    0.0003
+    0.8500      64     128     64    0.4    0.0001
+    0.8503      32      64     64    0.4    0.0001
+
+── Phase 2: Top 5 Lambda Configs ──
+     Score   λ_ret   λ_vol   λ_shp   λ_dir   λ_reg
+    0.8469     2.0     1.0     0.5     1.0     0.5
+    0.8493     1.0     1.0     0.5     1.0     0.5
+    0.8502     1.0     1.0     0.5     2.0     1.0
+    0.8506     1.0     1.0     0.3     2.0     0.5
+    0.8576     1.0     0.5     0.5     2.0     1.0
+
+── Best Overall Config ──
+  private_hidden: 32
+  shared_hidden: 64
+  num_heads: 2
+  num_layers: 2
+  spa_dim: 32
+  dropout: 0.4
+  lr: 0.0001
+  lambda_return: 2.0
+  lambda_vol: 1.0
+  lambda_sharpe: 0.5
+  lambda_direction: 1.0
+  lambda_regime: 0.5
+
+── Test Metrics (Best Model) ──
+  Return  MSE : 1.125925
+  Sharpe  MSE : 0.724634
+  Dir  Acc    : 0.4779  (47.8%)
+  Regime Acc  : 0.7579  (75.8%)
+  Composite   : 1.1963  (lower is better)
+
+  Best checkpoint saved to: results/best_tuned_spa_msjf_kronos.pt
+  Full results CSV        : results/tuning_results.csv
+============================================================

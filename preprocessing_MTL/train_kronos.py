@@ -35,9 +35,9 @@ def evaluate(model, wrapper, dataloader: DataLoader, device: torch.device) -> di
     for x, targets in dataloader:
         s1, s2 = x
         s1, s2 = s1.to(device), s2.to(device)
-        x_emb = wrapper(s1, s2)
-        outputs = model(x_emb)
- 
+        x_shared, x_private = wrapper(s1, s2)
+        outputs = model(x_shared, x_private)
+
         for k in range(len(STOCKS)):
             preds = outputs["stocks"][k]
             all_ret_pred[k].append(preds["return"].cpu())
@@ -97,14 +97,17 @@ def print_metrics(metrics: dict, split_name: str = ""):
     print()
 
 
-def save_results_to_markdown(metrics: dict, epochs: int, lr: float, checkpoint: str, version="1.0"):
+def save_results_to_markdown(metrics: dict, epochs: int, lr: float, checkpoint: str, version="1.1"):
     import datetime
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_dt = datetime.datetime.now()
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    safe_time = now_dt.strftime("%Y%m%d_%H%M%S")
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    filepath = os.path.join(current_dir, "results", "test_results.md")
+    filename = f"test_results_v{version}_{safe_time}.md"
+    filepath = os.path.join(current_dir, "results", filename)
     
     lines = [
-        f"## Test Run - {now}",
+        f"## Test Run - {now_str}",
         f"**Version**: {version}",
         f"**Configuration**: Epochs={epochs}, LR={lr}, Checkpoint={checkpoint}",
         "",
@@ -132,7 +135,7 @@ def save_results_to_markdown(metrics: dict, epochs: int, lr: float, checkpoint: 
     lines.append("\n---\n")
 
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "a") as f:
+    with open(filepath, "w") as f:
         f.write("\n".join(lines))
     print(f"Results saved to {filepath}")
 
@@ -197,9 +200,9 @@ def train(
             targets = {k: v.to(device) for k, v in targets.items()}
  
             optimizer.zero_grad()
-            
-            x_emb = wrapper(s1, s2)
-            outputs = model(x_emb)
+
+            x_shared, x_private = wrapper(s1, s2)
+            outputs = model(x_shared, x_private)
 
             loss, loss_dict = criterion(outputs, targets)
             loss.backward()
@@ -223,8 +226,8 @@ def train(
                 s1, s2 = s1.to(device), s2.to(device)
                 targets = {k: v.to(device) for k, v in targets.items()}
                 
-                x_emb = wrapper(s1, s2)
-                _, loss_dict = criterion(model(x_emb), targets)
+                x_shared, x_private = wrapper(s1, s2)
+                _, loss_dict = criterion(model(x_shared, x_private), targets)
                 
                 for k, v in loss_dict.items():
                     val_losses[k] = val_losses.get(k, 0.0) + v
@@ -277,6 +280,8 @@ def train(
     print("-- Test metrics -------------------------------------")
     test_metrics = evaluate(model, wrapper, test_dl, device)
     print_metrics(test_metrics, split_name="test")
+
+    save_results_to_markdown(test_metrics, epochs, lr, checkpoint)
  
     return {
         "history":      history,
@@ -291,7 +296,19 @@ def train(
 # ─────────────────────────────────────────────
  
 if __name__ == "__main__":
-    data_dir = "../Finance Data"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir",  default="../Finance Data")
+    parser.add_argument("--lora_path", default=None,
+                        help="Path to LoRA adapter dir. If omitted, auto-detects "
+                             "kronos_lora_adapted/ in the current directory.")
+    args = parser.parse_args()
+
+    data_dir  = args.data_dir
+    lora_path = args.lora_path
+    if lora_path is None and os.path.isdir("kronos_lora_adapted"):
+        lora_path = "kronos_lora_adapted"
+        print(f"Auto-detected LoRA adapter at: {lora_path}")
 
     def get_device() -> torch.device:
         if torch.cuda.is_available():
@@ -301,12 +318,13 @@ if __name__ == "__main__":
         return torch.device("cpu")
 
     device = get_device()
- 
+
     train_dl, val_dl, test_dl, meta = build_dataloaders(
         data_dir,
         seq_len=60,
         horizon=1,
         batch_size=32,
+        lora_path=lora_path,
     )
 
     wrapper = meta["wrapper"]
@@ -316,22 +334,22 @@ if __name__ == "__main__":
     model = SPAMSJF(
         num_stocks=5,
         input_dim=input_dim,
-        private_hidden=64,
-        shared_hidden=128,
-        spa_dim=64,
+        private_hidden=32,
+        shared_hidden=64,
+        spa_dim=32,
         num_direction_classes=3,
         num_regimes=2,
-        dropout=0.25,
-        num_heads=4,
+        dropout=0.4,
+        num_heads=2,
         num_layers=2,
     )
 
     criterion = JointLoss(
-        lambda_return=1.0,
-        lambda_vol=0.5,
-        lambda_sharpe=0.3,
+        lambda_return=2.0,
+        lambda_vol=1.0,
+        lambda_sharpe=0.5,
         lambda_direction=1.0,
-        lambda_regime=1.0,
+        lambda_regime=0.5,
     )
 
     results = train(
@@ -342,8 +360,8 @@ if __name__ == "__main__":
         val_dl=val_dl,
         test_dl=test_dl,
         device=device,
-        epochs=10,
-        lr=3e-4,
+        epochs=60,
+        lr=0.0001,
         patience=15,
         checkpoint="best_spa_msjf_kronos.pt",
     )
