@@ -195,3 +195,5 @@ No model beat the naive baseline for return prediction → strong evidence of **
 └── Sentiment Modeling: Scripts to Fine-Tune BERT to classify sentiment on financial data. The sentiment approach was abandoned since scraping sentiment data proved to be very difficult
 └── Scraped_data: Attempts to scrape from the Internet for Sentiment Analysis. 
 ```
+
+Note: Please refer to the individual README files for Multi-Task Learning and Multi-Task Learning: Kronos for more implementation details! 
