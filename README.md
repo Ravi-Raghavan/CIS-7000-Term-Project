@@ -50,6 +50,8 @@ Our core architecture builds on **Shared-Private Attention Multi-Stock Joint For
 - **SPA module**: Learns weighted fusion of shared/private features  
 - **Multi-head outputs**: One head per task  
 
+Note: Refer to the README.md under the Multi-Task Learning folder for more implementation details!
+
 ---
 
 ### 2. Representation Learning
@@ -86,6 +88,7 @@ We adapt the pretrained Kronos tokenizer using **LoRA (Low-Rank Adaptation)**:
 ---
 
 ### 4. Training Improvements
+Here is the list of improvements we made to the overall model architecture to get better results!
 - Layer normalization  
 - GELU activation  
 - Label smoothing  
