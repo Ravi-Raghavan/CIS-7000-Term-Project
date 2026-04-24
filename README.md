@@ -187,7 +187,11 @@ No model beat the naive baseline for return prediction → strong evidence of **
 ```text
 ├── Baseline: This folder contains the notebooks used to train the baseline models
 ├── Finance Data: Contains all the Stock Data (AAPL, GOOG, META, NVDA, TSLA)
+├── Market Regime Modeling: Contains baseline models for Market Regime Prediction
 └── Multi-Task Learning: Contains all the files used to train the SPA-MSJF Model
+└── Multi-Task Learning: Kronos: Contains all the files used to train the SPA-MSJF Model (uses Kronos as TS2Vec for Pre-Processing)
+└── Sharpe Ratio Modeling: Contains baseline models for Sharpe Ratio Prediction
+└── Sentiment Analysis: Test Scripts to test methods to scrape financial news articles pertaining to a stock
 └── Sentiment Modeling: Scripts to Fine-Tune BERT to classify sentiment on financial data. The sentiment approach was abandoned since scraping sentiment data proved to be very difficult
 └── Scraped_data: Attempts to scrape from the Internet for Sentiment Analysis. 
 ```

@@ -1,7 +1,7 @@
 # Shared-Private Attention Multi-Stock Joint Forecasting (SPA-MSJF)
 
 ## Overview
-This project implements a **Multi-Task Learning framework for Financial Time Series Forecasting** using a **Shared-Private architecture with Attention-Based Fusion (SPA)**.
+This project implements a **Multi-Task Learning framework for Financial Time Series Forecasting** using a **Shared-Private architecture with Attention-Based Fusion (SPA)**, where all time-series inputs are first processed using **TS2Vec embeddings**.
 
 The model performs joint multi-task prediction across several financial objectives. For each stock, it predicts:
 - Returns (regression)  
@@ -9,21 +9,50 @@ The model performs joint multi-task prediction across several financial objectiv
 - Sharpe ratio (regression)  
 - Direction (classification)  
 
-In addition, it predicts the overall market regime (classification), which is shared across all stocks rather than being stock-specific. 
+In addition, it predicts the **market regime** (classification), which is shared across all stocks.
 
-Overall, the key idea is to disentangle stock-specific signals (via a Private Encoder) from shared market-wide signals (via a Shared Encoder), and fuse them through a Shared-Private Attention (SPA) mechanism. For the stock-level tasks (returns, volatility, Sharpe ratio, and direction), the model uses a combination of private (idiosyncratic) and shared (market-driven) representations, with SPA dynamically weighting their contributions for each prediction. For the market regime classification, the model relies primarily on the shared encoder, since this task reflects global market conditions that are common across all stocks.
+The key idea is to:
+- Use **TS2Vec embeddings as a strong temporal representation layer**
+- Separate **stock-specific vs global market signals**
+- Fuse them using **Shared-Private Attention (SPA)** for downstream forecasting
 
 ---
 
 ## Architecture
 
 ### Input
-- Multiple stocks (K stocks)
-- Time series input of shape **(B, K, T, D)**
-- B: Batch Size 
-- K: Number of Stocks in Portfolio 
-- T: Length of Time Series
-- D: Dimension of Input Features
+- K stocks over time
+- TS2Vec time series features
+- Shape: **(B, K, T, D)**
+  - B: Batch size  
+  - K: Number of stocks  
+  - T: Time steps  
+  - D: Embedding dimension  
+
+---
+
+### 0. TS2Vec Preprocessing Layer
+
+Raw financial time series are first encoded using a **TS2Vec embedding model** to obtain rich temporal representations.
+
+TS2Vec captures:
+- Multi-scale temporal dependencies via contrastive hierarchical representations  
+- Robust time-series embeddings invariant to local perturbations  
+- Long-range temporal structure across price dynamics  
+
+For each stock $k$, we obtain:
+
+$$
+x_k^{(\text{TS2Vec})} \in \mathbb{R}^{T \times D_k}
+$$
+
+where:
+- $T$: sequence length  
+- $D_k$: embedding dimension  
+
+These embeddings are fed into both:
+- the **Shared Encoder** (global market signal extraction)
+- the **Private Encoder** (stock-specific representation learning)
 
 ---
 
@@ -154,17 +183,17 @@ $$
 ---
 
 ## Data Pipeline
-1. Prepare multi-stock time series  
-2. Construct:
-   - Input sequences  
-   - Multi-task targets:
-     - Returns  
-     - Volatility  
-     - Sharpe  
-     - Direction  
-     - Regime  
-3. Pretrain TS2Vec embeddings  
-4. Train SPA-MSJF model  
+
+1. Raw financial time series  
+2. TS2Vec embedding generation  
+3. Construct multi-stock tensors  
+4. Build multi-task labels:
+   - Returns  
+   - Volatility  
+   - Sharpe ratio  
+   - Direction  
+   - Market regime  
+5. Train SPA-MSJF model  
 
 ---
 
