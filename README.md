@@ -5,12 +5,13 @@
 This project investigates **multi-task learning for financial time series prediction under domain shift**, focusing on large-cap technology stocks: **AAPL, GOOG, META, NVDA, TSLA**.
 
 We study whether shared representations across:
-- **stocks** (cross-sectional transfer)  
+- **stocks**  
 - **tasks** (Return, Volatility, Sharpe Ratio, Direction, Regime)  
 
 can improve robustness under:
 - **covariate shift** (changing input distributions over time)  
 - **concept shift** (changing relationships, e.g., post-COVID dynamics)
+- **label shift** (return magnitudes and directional frequencies change during market transitions)
 
 Our core architecture builds on **Shared-Private Attention Multi-Stock Joint Forecasting (SPA-MSJF)**, combined with modern representation learning approaches.
 
@@ -32,13 +33,9 @@ Our core architecture builds on **Shared-Private Attention Multi-Stock Joint For
 ## Dataset
 - **Stocks**: AAPL, GOOG, META, NVDA, TSLA  
 - **Features**:
-  - OHLCV time series  
+  - OHLCV time series from Yahoo Finance
 - **Splits**:
   - Chronological (train / validation / test)  
-
-### Domain Shift Setup
-- Cross-stock generalization (train on subset, test on unseen stock)
-- Temporal shift (e.g., train on historical period, test on future period)
 
 ---
 
@@ -143,8 +140,7 @@ No model beat the naive baseline for return prediction → strong evidence of **
 
 ## Major Findings
 
-### 1. Domain Shift is the Core Challenge
-- Models trained on some stocks **fail to generalize** to others  
+### 1. Domain Shift is the Core Challenge  
 - Performance often drops to:
   - ~50% direction accuracy (random)  
   - naive-level RMSE  
