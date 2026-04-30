@@ -236,9 +236,6 @@ $$
 
 ## Domain Shift Setup
 
-- **Cross-stock generalization**  
-  Train on subset of stocks, test on unseen stocks  
-
 - **Temporal shift**  
   Train on past, evaluate on future  
 
